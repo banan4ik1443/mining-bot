@@ -16,11 +16,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import config
 from cards_config import SHOP_CARDS
 # В самом верху файла, после других импортов
-from keep_alive import keep_alive
 
-# Запускаем веб-сервер для UptimeRobot
-keep_alive()
-print("🌐 Веб-сервер для пинга запущен на порту 8080")
+
+#
 
 # Далее ваш существующий код...
 # Настройка логирования
