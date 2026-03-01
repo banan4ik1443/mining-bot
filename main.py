@@ -15,12 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import config
 from cards_config import SHOP_CARDS
-# В самом верху файла, после других импортов
 
-
-#
-
-# Далее ваш существующий код...
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -328,12 +323,19 @@ class Database:
 
     def get_user(self, user_id):
         self.cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        return self.cursor.fetchone()
+        result = self.cursor.fetchone()
+        if result:
+            # Преобразуем кортеж в список для безопасности
+            return list(result)
+        return None
 
     def get_user_by_custom_id(self, custom_id):
         """Получает пользователя по MID"""
         self.cursor.execute('SELECT * FROM users WHERE custom_id = ?', (custom_id,))
-        return self.cursor.fetchone()
+        result = self.cursor.fetchone()
+        if result:
+            return list(result)
+        return None
 
     def get_user_cards(self, user_id):
         self.cursor.execute('SELECT * FROM user_cards WHERE user_id = ? ORDER BY is_starter DESC', (user_id,))
@@ -342,6 +344,8 @@ class Database:
     def get_working_cards(self, user_id):
         """Получает работающие карты (стартовая всегда работает)"""
         user = self.get_user(user_id)
+        if not user:
+            return []
         level = user[11]
         
         # Получаем бонусы за уровень
@@ -483,12 +487,14 @@ class Database:
         # Проверяем, не истекла ли привилегия
         if privilege_until and privilege != "player":
             try:
-                until = datetime.fromisoformat(privilege_until)
-                if datetime.now() > until:
-                    # Привилегия истекла
-                    self.cursor.execute('UPDATE users SET privilege = "player", privilege_until = NULL WHERE user_id = ?', (user_id,))
-                    self.conn.commit()
-                    return "player", None
+                # Убеждаемся, что privilege_until - строка
+                if isinstance(privilege_until, str):
+                    until = datetime.fromisoformat(privilege_until)
+                    if datetime.now() > until:
+                        # Привилегия истекла
+                        self.cursor.execute('UPDATE users SET privilege = "player", privilege_until = NULL WHERE user_id = ?', (user_id,))
+                        self.conn.commit()
+                        return "player", None
             except:
                 pass
         
@@ -551,7 +557,7 @@ class Database:
             streak = 1
         
         # Получаем привилегию пользователя
-        privilege, _ = self.get_user_privilege(user_id)
+        privilege, until = self.get_user_privilege(user_id)
         priv_bonuses = self.get_privilege_bonuses(privilege)
         
         # Рассчитываем бонус
@@ -597,7 +603,7 @@ class Database:
             return base_ton, base_exp, wear_amount, None
         
         # Получаем привилегию пользователя
-        privilege, _ = self.get_user_privilege(user_id)
+        privilege, until = self.get_user_privilege(user_id)
         priv_bonuses = self.get_privilege_bonuses(privilege)
         
         # Проверяем шанс события с учетом привилегии
@@ -673,7 +679,7 @@ class Database:
                 return False, "Пользователь не найден"
             
             # Получаем привилегию для проверки лимита карт
-            privilege, _ = self.get_user_privilege(user_id)
+            privilege, until = self.get_user_privilege(user_id)
             priv_bonuses = self.get_privilege_bonuses(privilege)
             max_cards = priv_bonuses["max_cards"]
             
@@ -941,7 +947,7 @@ class Database:
         bonuses = self.get_level_bonuses(level)
         
         # Получаем привилегию пользователя
-        privilege, _ = self.get_user_privilege(user_id)
+        privilege, until = self.get_user_privilege(user_id)
         priv_bonuses = self.get_privilege_bonuses(privilege)
         
         # Общая скидка
@@ -1236,14 +1242,18 @@ class Database:
     # ==================== МЕТОДЫ ДЛЯ АВТОМАТИЧЕСКОГО ПОПОЛНЕНИЯ ====================
     def get_price_category(self, price):
         """Определяет категорию карты по цене"""
-        if price < 1000:
-            return "low"
-        elif price < 3000:
-            return "medium"
-        elif price < 6000:
-            return "high"
-        else:
-            return "very_high"
+        try:
+            price = int(price)
+            if price < 1000:
+                return "low"
+            elif price < 3000:
+                return "medium"
+            elif price < 6000:
+                return "high"
+            else:
+                return "very_high"
+        except:
+            return "medium"  # Значение по умолчанию
 
     def auto_restock(self):
         """Автоматическое пополнение склада"""
@@ -1260,10 +1270,19 @@ class Database:
             restock_log = []
             
             for card in cards:
+                # Убеждаемся, что card - это кортеж с правильными значениями
+                if not isinstance(card, (tuple, list)) or len(card) < 4:
+                    print(f"⚠️ Пропущена карта с неправильным форматом: {card}")
+                    continue
+                    
                 card_id = card[0]
                 card_name = card[1]
                 price = card[2]
                 current_stock = card[3]
+                
+                # Проверяем, что current_stock - число
+                if not isinstance(current_stock, (int, float)):
+                    current_stock = 0
                 
                 # Определяем категорию цены и соответствующий шанс
                 category = self.get_price_category(price)
@@ -1296,6 +1315,8 @@ class Database:
             
         except Exception as e:
             print(f"❌ Ошибка при автоматическом пополнении: {e}")
+            import traceback
+            traceback.print_exc()
             return 0, []
 
     def check_and_restock(self):
@@ -1990,18 +2011,20 @@ async def show_user_profile(message_or_callback, user_id, is_own=True):
         username = user[2]
         first_name = user[3]
         
-        # Формируем ник
-        if username:
-            name_display = f"@{username}"
-        else:
-            name_display = escape_html(first_name)
+        # Формируем ник (используем first_name, который меняется через /nick)
+        name_display = escape_html(first_name)
         
         # Проверяем, админ ли
         admin_tag = " 👑 АДМИН" if is_admin(user_id) else ""
         
-        # Получаем привилегию
-        privilege, until = db.get_user_privilege(user_id)
-        privilege_data = config.PRIVILEGES[privilege]
+        # Получаем привилегию с проверкой
+        priv_result = db.get_user_privilege(user_id)
+        if isinstance(priv_result, tuple) and len(priv_result) >= 2:
+            privilege, until = priv_result
+        else:
+            privilege, until = "player", None
+            
+        privilege_data = config.PRIVILEGES.get(privilege, config.PRIVILEGES["player"])
         privilege_name = f"{privilege_data['icon']} {privilege_data['name']}"
         
         # Вычисляем время в игре
@@ -2240,11 +2263,19 @@ async def process_buy(callback: CallbackQuery):
     success, message, bought_card_id = db.buy_card(callback.from_user.id, card_id)
     
     if success:
-        await callback.message.edit_caption(
-            caption=f"✅ {message}",
-            reply_markup=get_continue_shopping_keyboard(),
-            parse_mode="HTML"
-        )
+        # Проверяем, есть ли caption (значит это фото)
+        if callback.message.caption:
+            await callback.message.edit_caption(
+                caption=f"✅ {message}",
+                reply_markup=get_continue_shopping_keyboard(),
+                parse_mode="HTML"
+            )
+        else:
+            await callback.message.edit_text(
+                f"✅ {message}",
+                reply_markup=get_continue_shopping_keyboard(),
+                parse_mode="HTML"
+            )
     else:
         if "Недостаточно средств" in message:
             await callback.answer("❌ Недостаточно средств!", show_alert=True)
@@ -2317,6 +2348,34 @@ async def process_card_photo(message: Message, state: FSMContext):
     )
     
     await state.clear()
+
+@dp.message(Command("box"))
+async def cmd_box(message: Message):
+    """Открыть одну коробку"""
+    if await check_ban(message.from_user.id):
+        await send_ban_message(message)
+        return
+    
+    user = db.get_user(message.from_user.id)
+    boxes_count = user[19] if len(user) > 19 else 0
+    
+    if boxes_count == 0:
+        await message.answer("📦 У тебя нет коробок! Майни, чтобы получить коробки.")
+        return
+    
+    # Получаем первую неоткрытую коробку
+    boxes = db.get_user_boxes(message.from_user.id, unopened_only=True)
+    if not boxes:
+        await message.answer("❌ Ошибка: коробки не найдены")
+        return
+    
+    box_id = boxes[0][0]
+    success, result = db.open_box(box_id)
+    
+    if success:
+        await message.answer(result, parse_mode="HTML")
+    else:
+        await message.answer(result)
 
 @dp.message(Command("wallet"))
 async def cmd_wallet(message: Message):
@@ -3170,7 +3229,7 @@ async def help_boxes(callback: CallbackQuery):
         "• Опыт\n"
         "• Компоненты для крафта\n"
         "• Привилегии (редкий шанс)\n\n"
-        "Команда: /boxes"
+        "Команды: /boxes, /box"
     )
     await callback.message.edit_text(text, reply_markup=get_back_to_help_keyboard())
 
