@@ -3,18 +3,21 @@ import ast
 
 # ==================== НАСТРОЙКИ БОТА ====================
 
-# Токен бота из секретов Replit
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
+# Токен бота (можно оставить пустым, если используешь local_config.py)
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
 
-# ID администраторов из секретов Replit
+# ID администраторов
 admin_ids_str = os.environ.get('ADMIN_IDS', '[8044082858]')
-ADMIN_IDS = ast.literal_eval(admin_ids_str)
+try:
+    ADMIN_IDS = ast.literal_eval(admin_ids_str)
+except:
+    ADMIN_IDS = [8044082858]
 
-# Юзернейм бота из секретов Replit
-BOT_USERNAME = os.environ.get('BOT_USERNAME', 'your_bot_username')
+# Юзернейм бота
+BOT_USERNAME = os.environ.get('BOT_USERNAME', 'Bananazzabot')
 
 # Настройки майнинга
-MINING_COOLDOWN = 3600  # 1 час в секундах
+MINING_COOLDOWN = 0  # 1 час в секундах
 BASE_REWARD = 10  # Базовая награда за майнинг
 HASHRATE_MULTIPLIER = 0.4  # Множитель хешрейта к награде
 WEAR_PER_USE = 5  # Износ за один майнинг
@@ -28,7 +31,7 @@ EXP_FROM_HASHRATE = 0.2  # Опыт от хешрейта
 # Стартовая карта
 STARTER_CARD_NAME = "Встроенная графика Intel HD"
 STARTER_CARD_HASHRATE = 5  # 5 MH/s
-START_BALANCE = 100  # Стартовый баланс в тонах
+START_BALANCE = 1000  # Стартовый баланс в тонах
 
 # Настройки рефералов
 REFERRAL_BONUS = 600  # Бонус пригласившему в тонах
@@ -66,14 +69,14 @@ LEVEL_REWARDS = {
     4: {"ton": 300, "exp": 150, "bonus": "+300 тон, +150 опыта"},
     5: {"ton": 500, "exp": 200, "bonus": "+500 тон, +200 опыта"},
     10: {"ton": 1000, "exp": 500, "bonus": "Скидка на ремонт 5%", "repair_discount": 5},
-    15: {"ton": 1500, "exp": 750, "bonus": "Бонус к стартовой карте x1.5", "starter_bonus": 1.5},
-    20: {"ton": 2000, "exp": 1000, "bonus": "+5 MH/s ко всем картам", "hash_bonus": 5},
+    15: {"ton": 1500, "exp": 750, "bonus": "Бонус к стартовому ASIC x1.5", "starter_bonus": 1.5},
+    20: {"ton": 2000, "exp": 1000, "bonus": "+5 MH/s ко всем ASIC", "hash_bonus": 5},
     25: {"ton": 2500, "exp": 1250, "bonus": "Скидка на ремонт 10%", "repair_discount": 10},
-    30: {"ton": 3000, "exp": 1500, "bonus": "Бонус к стартовой карте x2", "starter_bonus": 2.0},
-    35: {"ton": 3500, "exp": 1750, "bonus": "+10 MH/s ко всем картам", "hash_bonus": 10},
+    30: {"ton": 3000, "exp": 1500, "bonus": "Бонус к стартовому ASIC x2", "starter_bonus": 2.0},
+    35: {"ton": 3500, "exp": 1750, "bonus": "+10 MH/s ко всем ASIC", "hash_bonus": 10},
     40: {"ton": 4000, "exp": 2000, "bonus": "Скидка на ремонт 15%", "repair_discount": 15},
-    45: {"ton": 4500, "exp": 2250, "bonus": "+15 MH/s ко всем картам", "hash_bonus": 15},
-    50: {"ton": 5000, "exp": 2500, "bonus": "Бонус к стартовой карте x3", "starter_bonus": 3.0},
+    45: {"ton": 4500, "exp": 2250, "bonus": "+15 MH/s ко всем ASIC", "hash_bonus": 15},
+    50: {"ton": 5000, "exp": 2500, "bonus": "Бонус к стартовому ASIC x3", "starter_bonus": 3.0},
 }
 
 # Настройки привилегий
