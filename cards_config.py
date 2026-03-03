@@ -1,6 +1,7 @@
-# ==================== КОНФИГУРАЦИЯ КАРТ ====================
+# ==================== КОНФИГУРАЦИЯ ВСЕГО ОБОРУДОВАНИЯ ====================
 
-SHOP_CARDS = {
+# Видеокарты (GPU)
+GPU_CARDS = {
     # NVIDIA Серия GTX 10
     "gtx_1050_ti": {
         "name": "GTX 1050 Ti",
@@ -322,4 +323,116 @@ SHOP_CARDS = {
         "memory": 16,
         "release_year": 2020
     }
+}
+
+# Куллеры (Coolers)
+COOLERS = {
+    "deepcool_fc120": {
+        "name": "DEEPCOOL FC120",
+        "price": 500,
+        "stock": 20,
+        "cooling_power": 30,
+        "noise_level": 20,
+        "power_consumption": 5,
+        "wear_reduction": 10,
+        "description": "Базовый кулер для охлаждения видеокарт"
+    },
+    "delta_afc1512dg": {
+        "name": "Delta AFC1512DG",
+        "price": 1200,
+        "stock": 15,
+        "cooling_power": 45,
+        "noise_level": 35,
+        "power_consumption": 8,
+        "wear_reduction": 20,
+        "description": "Средний кулер с хорошим охлаждением"
+    },
+    "delta_qfr1212he": {
+        "name": "Delta QFR1212HE",
+        "price": 2500,
+        "stock": 10,
+        "cooling_power": 70,
+        "noise_level": 45,
+        "power_consumption": 12,
+        "wear_reduction": 30,
+        "description": "Мощный кулер для профессионального майнинга"
+    }
+}
+
+# ASIC-майнеры
+ASICS = {
+    "antminer_s9": {
+        "name": "Antminer S9",
+        "hash_rate": 13.5,
+        "price": 50000,
+        "stock": 5,
+        "power_consumption": 1350,
+        "wear_rate": 2,
+        "noise_level": 75,
+        "description": "Классический ASIC для Bitcoin, надежный и проверенный"
+    },
+    "antminer_s19_pro": {
+        "name": "Antminer S19 Pro",
+        "hash_rate": 110,
+        "price": 150000,
+        "stock": 3,
+        "power_consumption": 3250,
+        "wear_rate": 3,
+        "noise_level": 80,
+        "description": "Мощный ASIC для профессионального майнинга"
+    },
+    "whatsminer_m30s": {
+        "name": "Whatsminer M30S",
+        "hash_rate": 86,
+        "price": 120000,
+        "stock": 4,
+        "power_consumption": 3400,
+        "wear_rate": 2,
+        "noise_level": 78,
+        "description": "Эффективный ASIC от MicroBT с хорошим соотношением цена/качество"
+    }
+}
+
+# GPU-риги
+GPU_RIGS = {
+    "mini_rig": {
+        "name": "Mini Rig",
+        "price": 20000,
+        "stock": 10,
+        "gpu_slots": 3,
+        "cooler_slots": 1,
+        "description": "Компактный риг на 3 видеокарты и 1 кулер. Идеален для начала",
+        "max_power": 1000,
+        "size": "компактный"
+    },
+    "midi_rig": {
+        "name": "Midi Rig",
+        "price": 35000,
+        "stock": 8,
+        "gpu_slots": 6,
+        "cooler_slots": 2,
+        "description": "Средний риг на 6 видеокарт и 2 кулера. Оптимальный выбор",
+        "max_power": 2000,
+        "size": "средний"
+    },
+    "mega_rig": {
+        "name": "Mega Rig",
+        "price": 50000,
+        "stock": 5,
+        "gpu_slots": 9,
+        "cooler_slots": 3,
+        "description": "Мощный риг на 9 видеокарт и 3 кулера. Для профессионального майнинга",
+        "max_power": 3000,
+        "size": "большой"
+    }
+}
+
+# Стартовый ASIC для новых игроков
+STARTER_ASIC = {
+    "name": "Starter ASIC Mini",
+    "hash_rate": 5,
+    "price": 0,
+    "description": "Базовый ASIC для начала майнинга",
+    "power_consumption": 100,
+    "wear_rate": 1
 }
