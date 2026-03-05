@@ -41,7 +41,12 @@ def escape_html(text):
 # ==================== БАЗА ДАННЫХ ====================
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('mining_bot.db', check_same_thread=False)
+        self.conn = sqlite3.connect('mining_bot.db', check_same_thread=False, timeout=30)
+        self.conn.execute('PRAGMA journal_mode=WAL')
+        self.conn.execute('PRAGMA busy_timeout=30000')
+        self.conn.execute('PRAGMA synchronous=NORMAL')
+        self.conn.execute('PRAGMA cache_size=-32000')
+        self.conn.execute('PRAGMA temp_store=MEMORY')
         self.cursor = self.conn.cursor()
         self.init_db()
 
@@ -86,10 +91,63 @@ class Database:
                 is_installed INTEGER DEFAULT 0,
                 rig_id INTEGER DEFAULT NULL,
                 slot_index INTEGER DEFAULT NULL,
+                is_crafted INTEGER DEFAULT 0,
+                wear_multiplier REAL DEFAULT 1.0,
                 FOREIGN KEY (user_id) REFERENCES users (user_id)
             )
         ''')
         
+        # Миграция: таблица барахолки
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS market_listings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    seller_id INTEGER NOT NULL,
+                    item_type TEXT NOT NULL,
+                    item_id INTEGER NOT NULL,
+                    item_name TEXT NOT NULL,
+                    hash_rate REAL DEFAULT 0,
+                    cooling_power INTEGER DEFAULT 0,
+                    wear INTEGER DEFAULT 100,
+                    price INTEGER NOT NULL,
+                    is_crafted INTEGER DEFAULT 0,
+                    listed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL,
+                    is_active INTEGER DEFAULT 1
+                )
+            ''')
+        except Exception:
+            pass
+
+        # Миграция: добавляем поля крафта в user_gpus если нет
+        try:
+            self.cursor.execute("ALTER TABLE user_gpus ADD COLUMN is_crafted INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            self.cursor.execute("ALTER TABLE user_gpus ADD COLUMN wear_multiplier REAL DEFAULT 1.0")
+        except Exception:
+            pass
+
+        # Таблица барахолки (вторичный рынок)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS market_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER NOT NULL,
+                item_type TEXT NOT NULL,        -- 'gpu' or 'cooler'
+                item_id INTEGER NOT NULL,        -- id из user_gpus / user_coolers
+                item_name TEXT NOT NULL,
+                hash_rate REAL DEFAULT 0,
+                cooling_power INTEGER DEFAULT 0,
+                wear INTEGER DEFAULT 100,
+                price INTEGER NOT NULL,
+                is_crafted INTEGER DEFAULT 0,
+                listed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+
         # Таблица куллеров пользователя
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_coolers (
@@ -299,6 +357,19 @@ class Database:
             )
         ''')
         
+        # Таблица анкет игроков
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id INTEGER PRIMARY KEY,
+                birthday TEXT DEFAULT NULL,
+                gender TEXT DEFAULT NULL,
+                about TEXT DEFAULT NULL,
+                city TEXT DEFAULT NULL,
+                show_birthday INTEGER DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users (user_id)
+            )
+        ''')
+        
         # Таблица чеков и счётов
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS checks (
@@ -363,6 +434,42 @@ class Database:
             )
         ''')
         
+        # Индексы для ускорения запросов
+        for _idx in [
+            'CREATE INDEX IF NOT EXISTS idx_gpus_user ON user_gpus(user_id)',
+            'CREATE INDEX IF NOT EXISTS idx_coolers_user ON user_coolers(user_id)',
+            'CREATE INDEX IF NOT EXISTS idx_asics_user ON user_asics(user_id)',
+            'CREATE INDEX IF NOT EXISTS idx_rigs_user ON user_rigs(user_id)',
+            'CREATE INDEX IF NOT EXISTS idx_market_active ON market_listings(is_active,item_type)',
+            'CREATE INDEX IF NOT EXISTS idx_events_user ON events_log(user_id)',
+        ]:
+            try:
+                self.cursor.execute(_idx)
+            except Exception:
+                pass
+        # Миграция: таблица заданий
+        self.cursor.execute(
+            'CREATE TABLE IF NOT EXISTS user_quests '
+            '(user_id INTEGER PRIMARY KEY, quest_data TEXT DEFAULT \'{}\')'
+        )
+        # Миграция: колонки системы усталости (anti-autoclicker)
+        for _col, _td in [
+            ('fatigue_count', 'INTEGER DEFAULT 0'),
+            ('fatigue_reset_at', 'TIMESTAMP DEFAULT NULL'),
+            ('daily_mines', 'INTEGER DEFAULT 0'),
+            ('daily_mines_date', 'DATE DEFAULT NULL'),
+        ]:
+            try:
+                self.cursor.execute(f'ALTER TABLE users ADD COLUMN {_col} {_td}')
+                self.conn.commit()
+            except Exception:
+                pass  # колонка уже существует
+        # Восстанавливаем все сломанные асики (они больше не ломаются)
+        try:
+            self.cursor.execute('UPDATE user_asics SET is_working=1 WHERE is_working=0')
+            self.conn.commit()
+        except Exception:
+            pass
         self.conn.commit()
         self.init_shop()
 
@@ -580,11 +687,9 @@ class Database:
         return self.cursor.fetchall()
 
     def get_working_asics(self, user_id):
-        """Получает работающие ASIC-майнеры (не сломанные)"""
-        self.cursor.execute('''
-            SELECT * FROM user_asics 
-            WHERE user_id = ? AND wear > ? AND is_working = 1
-        ''', (user_id, config.MIN_WEAR_FOR_MINING))
+        """Получает все ASIC-майнеры пользователя (не ломаются)"""
+        self.cursor.execute(
+            'SELECT * FROM user_asics WHERE user_id = ?', (user_id,))
         return self.cursor.fetchall()
 
     def get_asic_by_id(self, asic_id):
@@ -811,8 +916,8 @@ class Database:
             # 1. Хешрейт от ASIC (прямой SQL)
             c1 = self.conn.cursor()
             c1.execute(
-                'SELECT COALESCE(SUM(hash_rate), 0) FROM user_asics WHERE user_id = ? AND wear > ? AND is_working = 1',
-                (user_id, config.MIN_WEAR_FOR_MINING)
+                'SELECT COALESCE(SUM(hash_rate), 0) FROM user_asics WHERE user_id = ?',
+                (user_id,)
             )
             asic_hash = float(c1.fetchone()[0] or 0)
             
@@ -890,14 +995,15 @@ class Database:
     # ========== МЕТОДЫ ДЛЯ ВИДЕОКАРТ И КУЛЛЕРОВ ==========
     
     def get_user_gpus(self, user_id, include_installed=True):
+        c = self.conn.cursor()
         if include_installed:
-            self.cursor.execute('SELECT * FROM user_gpus WHERE user_id = ? ORDER BY id', (user_id,))
+            c.execute('SELECT * FROM user_gpus WHERE user_id = ? ORDER BY id', (user_id,))
         else:
-            self.cursor.execute('SELECT * FROM user_gpus WHERE user_id = ? AND is_installed = 0 ORDER BY id', (user_id,))
-        return self.cursor.fetchall()
+            c.execute('SELECT * FROM user_gpus WHERE user_id = ? AND is_installed = 0 ORDER BY id', (user_id,))
+        return c.fetchall()
 
     def get_free_gpus(self, user_id):
-        """Получает видеокарты, не установленные в риги"""
+        """Получает видеокарты, не установленные в риги и не на барахолке"""
         self.cursor.execute('''
             SELECT * FROM user_gpus 
             WHERE user_id = ? AND (is_installed = 0 OR is_installed IS NULL)
@@ -905,29 +1011,48 @@ class Database:
         ''', (user_id,))
         return self.cursor.fetchall()
 
+    def get_free_gpus_for_sale(self, user_id):
+        """Только свободные карты (не в риге, не на барахолке)"""
+        self.cursor.execute(
+            'SELECT * FROM user_gpus WHERE user_id = ? AND is_installed = 0 ORDER BY id',
+            (user_id,)
+        )
+        return self.cursor.fetchall()
+
     def get_free_coolers(self, user_id):
-        """Получает куллеры, не установленные в риги"""
+        """Получает куллеры, не установленные в риги и не на барахолке"""
         self.cursor.execute('''
             SELECT * FROM user_coolers 
-            WHERE user_id = ? AND (is_installed = 0 OR is_installed IS NULL)
+            WHERE user_id = ? AND (rig_id IS NULL) AND (is_installed = 0 OR is_installed IS NULL)
             ORDER BY id
         ''', (user_id,))
         return self.cursor.fetchall()
 
-    def get_user_coolers(self, user_id, include_installed=True):
-        if include_installed:
-            self.cursor.execute('SELECT * FROM user_coolers WHERE user_id = ? ORDER BY id', (user_id,))
-        else:
-            self.cursor.execute('SELECT * FROM user_coolers WHERE user_id = ? AND is_installed = 0 ORDER BY id', (user_id,))
+    def get_free_coolers_for_sale(self, user_id):
+        """Только свободные куллеры (не в риге, не на барахолке)"""
+        self.cursor.execute(
+            'SELECT * FROM user_coolers WHERE user_id = ? AND rig_id IS NULL AND (is_installed = 0 OR is_installed IS NULL) ORDER BY id',
+            (user_id,)
+        )
         return self.cursor.fetchall()
 
+    def get_user_coolers(self, user_id, include_installed=True):
+        c = self.conn.cursor()
+        if include_installed:
+            c.execute('SELECT * FROM user_coolers WHERE user_id = ? ORDER BY id', (user_id,))
+        else:
+            c.execute('SELECT * FROM user_coolers WHERE user_id = ? AND is_installed = 0 ORDER BY id', (user_id,))
+        return c.fetchall()
+
     def get_gpu_by_id(self, gpu_id):
-        self.cursor.execute('SELECT * FROM user_gpus WHERE id = ?', (gpu_id,))
-        return self.cursor.fetchone()
+        c = self.conn.cursor()
+        c.execute('SELECT * FROM user_gpus WHERE id = ?', (gpu_id,))
+        return c.fetchone()
 
     def get_cooler_by_id(self, cooler_id):
-        self.cursor.execute('SELECT * FROM user_coolers WHERE id = ?', (cooler_id,))
-        return self.cursor.fetchone()
+        c = self.conn.cursor()
+        c.execute('SELECT * FROM user_coolers WHERE id = ?', (cooler_id,))
+        return c.fetchone()
 
     def repair_gpu(self, gpu_id):
         self.cursor.execute('UPDATE user_gpus SET wear = 100 WHERE id = ?', (gpu_id,))
@@ -940,8 +1065,7 @@ class Database:
         return True
 
     def repair_asic(self, asic_id):
-        self.cursor.execute('UPDATE user_asics SET wear = 100 WHERE id = ?', (asic_id,))
-        self.conn.commit()
+        pass  # ASIC не ломаются
         return True
 
     # ========== МЕТОДЫ ДЛЯ МАГАЗИНА ==========
@@ -1315,6 +1439,76 @@ class Database:
 
     # ========== МЕТОДЫ ДЛЯ МАЙНИНГА ==========
     
+
+    # ========== СИСТЕМА УСТАЛОСТИ (anti-autoclicker) ==========
+
+    def get_fatigue_info(self, user_id: int):
+        """
+        Возвращает (multiplier, count, secs_to_reset).
+        Пороги: 0-4 = 100%, 5-14 = 50%, 15-29 = 20%, 30+ = 8%.
+        Сброс каждые 8 часов.
+        """
+        RESET_HOURS = 8
+        TIERS = [(5, 1.0), (15, 0.50), (30, 0.20), (9999, 0.08)]
+        c = self.conn.cursor()
+        c.execute('SELECT fatigue_count, fatigue_reset_at FROM users WHERE user_id=?', (user_id,))
+        row = c.fetchone()
+        if not row:
+            return 1.0, 0, 0
+        count = row[0] or 0
+        reset_at = row[1]
+        now = datetime.now()
+        if reset_at:
+            try:
+                rt = datetime.fromisoformat(reset_at)
+                if now >= rt:
+                    nxt = now + timedelta(hours=RESET_HOURS)
+                    self.cursor.execute(
+                        'UPDATE users SET fatigue_count=0, fatigue_reset_at=? WHERE user_id=?',
+                        (nxt.isoformat(), user_id))
+                    self.conn.commit()
+                    count = 0
+                    reset_at = nxt.isoformat()
+            except Exception:
+                count = 0
+        else:
+            nxt = now + timedelta(hours=RESET_HOURS)
+            self.cursor.execute(
+                'UPDATE users SET fatigue_reset_at=? WHERE user_id=?',
+                (nxt.isoformat(), user_id))
+            self.conn.commit()
+            reset_at = nxt.isoformat()
+        mult = 0.08
+        for thr, m in TIERS:
+            if count < thr:
+                mult = m
+                break
+        secs = 0
+        if reset_at:
+            try:
+                secs = max(0, int((datetime.fromisoformat(reset_at) - now).total_seconds()))
+            except Exception:
+                pass
+        return mult, count, secs
+
+    def bump_fatigue(self, user_id: int):
+        """Увеличить усталость на 1 и обновить daily_mines."""
+        self.cursor.execute(
+            'UPDATE users SET fatigue_count=COALESCE(fatigue_count,0)+1 WHERE user_id=?',
+            (user_id,))
+        today = datetime.now().date().isoformat()
+        self.cursor.execute(
+            'SELECT daily_mines_date FROM users WHERE user_id=?', (user_id,))
+        row2 = self.cursor.fetchone()
+        if row2 and row2[0] == today:
+            self.cursor.execute(
+                'UPDATE users SET daily_mines=daily_mines+1 WHERE user_id=?', (user_id,))
+        else:
+            self.cursor.execute(
+                'UPDATE users SET daily_mines=1, daily_mines_date=? WHERE user_id=?',
+                (today, user_id))
+        self.conn.commit()
+
     def mine(self, user_id):
         user = self.get_user(user_id)
         if not user:
@@ -1329,15 +1523,12 @@ class Database:
                 time_diff = datetime.now() - last_time
                 if time_diff.total_seconds() < config.MINING_COOLDOWN:
                     remaining = config.MINING_COOLDOWN - time_diff.total_seconds()
-                    hours = int(remaining // 3600)
-                    minutes = int((remaining % 3600) // 60)
-                    seconds = int(remaining % 60)
-                    
-                    time_str = f"{hours:02d}.{minutes:02d}.{seconds:02d}"
+                    rem_m = int(remaining // 60)
+                    rem_s = int(remaining % 60)
+                    time_str = f"{rem_m:02d}:{rem_s:02d}"
                     return False, (
-                        f"⏳ <b>Не прошло время до следующего майнинга!</b>\n\n"
-                        f"Следующая попытка через: {time_str}\n\n"
-                        f"<i>Наберись терпения, майнинг требует отдыха</i> 😴"
+                        f"⏳ <b>Рано!</b>\n\n"
+                        f"Следующий майнинг через: <b>{time_str}</b>"
                     )
             except Exception as e:
                 logger.error(f"Ошибка парсинга времени: {e}")
@@ -1363,22 +1554,16 @@ class Database:
         if total_hash == 0:
             total_hash = 5  # Минимальный хешрейт для старта
         
-        base_ton = int(total_hash * config.HASHRATE_MULTIPLIER) + config.BASE_REWARD
+        # ── Система усталости (diminishing returns) ──
+        _fatigue_mult, _fatigue_cnt, _fatigue_secs = self.get_fatigue_info(user_id)
+        self.bump_fatigue(user_id)
+        raw_ton = int(total_hash * config.HASHRATE_MULTIPLIER) + config.BASE_REWARD
+        base_ton = max(1, int(raw_ton * _fatigue_mult))
         exp_gain = config.EXP_FROM_MINING_BASE + int(total_hash * config.EXP_FROM_HASHRATE)
-        
+
         wear_per_use = config.WEAR_PER_USE
         
-        # Износ для ASIC
-        if asics:
-            for asic in asics:
-                try:
-                    new_wear = asic[5] - wear_per_use
-                    if new_wear <= 0:
-                        self.cursor.execute('UPDATE user_asics SET wear = 0, is_working = 0 WHERE id = ?', (asic[0],))
-                    else:
-                        self.cursor.execute('UPDATE user_asics SET wear = ? WHERE id = ?', (new_wear, asic[0]))
-                except (ValueError, TypeError):
-                    continue
+        # ASIC не изнашиваются
         
         # Износ для GPU в ригах
         if rigs:
@@ -1400,7 +1585,10 @@ class Database:
                 if gpus:
                     for gpu in gpus:
                         try:
-                            new_wear = gpu[5] - effective_wear
+                            # Крафтовые GPU изнашиваются вдвое медленнее
+                            gpu_wear_mult = float(gpu[10]) if len(gpu) > 10 and gpu[10] is not None else 1.0
+                            gpu_effective_wear = max(1, int(effective_wear * gpu_wear_mult))
+                            new_wear = gpu[5] - gpu_effective_wear
                             if new_wear <= 0:
                                 self.cursor.execute('UPDATE user_gpus SET wear = 0 WHERE id = ?', (gpu[0],))
                             else:
@@ -1431,17 +1619,36 @@ class Database:
         self.recalculate_user_hashrate(user_id)
         
         # Формируем ответ
+        # Строка усталости
+        if _fatigue_mult >= 1.0:
+            _f_line = ""
+        else:
+            _fh = _fatigue_secs // 3600
+            _fm = (_fatigue_secs % 3600) // 60
+            _pct = int((1 - _fatigue_mult) * 100)
+            _ico = "😴" if _fatigue_mult >= 0.5 else ("😫" if _fatigue_mult >= 0.2 else "💀")
+            _f_line = f"\n{_ico} <i>Усталость -{_pct}% (сброс через {_fh}ч {_fm}м)</i>"
+
         result = f"<b>⛏ Успешный майнинг!</b>\n\n"
         result += f"<blockquote>"
         result += f"Твой HM/s ›› {total_hash:.0f}\n"
-        result += f"Тон ›› {base_ton}\n"
-        result += f"Опыт ›› {exp_gain}"
+        result += f"Тон ›› {base_ton}"
+        if _fatigue_mult < 1.0:
+            result += f" (было бы {raw_ton})"
+        result += f"\nОпыт ›› {exp_gain}"
         result += f"</blockquote>\n\n"
-        
+
         if box_reward:
             result += f"{box_reward}\n"
-        
-        result += f"⏳ <b>Следующая попытка</b> через 1.00.00\n"
+
+        result += _f_line
+
+        # Считаем реальный оставшийся КД
+        _next_mine = datetime.now() + timedelta(seconds=config.MINING_COOLDOWN)
+        _rem = config.MINING_COOLDOWN
+        _rem_m = int(_rem // 60)
+        _rem_s = int(_rem % 60)
+        result += f"\n⏳ <b>Следующий майнинг</b> через {_rem_m:02d}:{_rem_s:02d}"
         
         return True, result, bool(box_reward)
 
@@ -1539,10 +1746,9 @@ class Database:
         self.conn.commit()
 
     def get_user_components(self, user_id):
-        self.cursor.execute('''
-            SELECT component_name, amount FROM components WHERE user_id = ?
-        ''', (user_id,))
-        return self.cursor.fetchall()
+        c = self.conn.cursor()
+        c.execute('SELECT component_name, amount FROM components WHERE user_id = ?', (user_id,))
+        return c.fetchall()
 
     # ========== МЕТОДЫ ДЛЯ СТАТИСТИКИ ==========
     
@@ -1680,6 +1886,42 @@ class Database:
         
         return True, f"Привилегия {privilege_data['icon']} {privilege_data['name']} активирована до {privilege_until.strftime('%d.%m.%Y')}"
 
+
+    def get_user_profile(self, user_id):
+        c = self.conn.cursor()
+        c.execute('SELECT * FROM user_profiles WHERE user_id = ?', (user_id,))
+        row = c.fetchone()
+        if not row:
+            self.conn.cursor().execute(
+                'INSERT OR IGNORE INTO user_profiles (user_id) VALUES (?)', (user_id,)
+            )
+            self.conn.commit()
+            c2 = self.conn.cursor()
+            c2.execute('SELECT * FROM user_profiles WHERE user_id = ?', (user_id,))
+            row = c2.fetchone()
+        return row  # user_id, birthday, gender, about, city, show_birthday
+
+    def update_user_profile(self, user_id, field, value):
+        allowed = {'birthday', 'gender', 'about', 'city', 'show_birthday'}
+        if field not in allowed:
+            return False
+        c = self.conn.cursor()
+        c.execute(f'INSERT OR IGNORE INTO user_profiles (user_id) VALUES (?)', (user_id,))
+        c.execute(f'UPDATE user_profiles SET {field} = ? WHERE user_id = ?', (value, user_id))
+        self.conn.commit()
+        return True
+
+
+    def get_user_referrals(self, user_id, limit=50):
+        """Получить список рефералов пользователя"""
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT user_id, first_name, username, level, gems, created_at
+            FROM users WHERE referrer_id = ?
+            ORDER BY created_at DESC LIMIT ?
+        """, (user_id, limit))
+        return c.fetchall()
+
     # ========== АДМИН МЕТОДЫ ==========
     
     def add_gems(self, user_id, amount, admin_id):
@@ -1790,6 +2032,263 @@ class Database:
         except Exception as e:
             logger.error(f"migrate_hashrates error: {e}")
             return 0, 0
+
+
+    # ========== БАРАХОЛКА ==========
+
+    def market_list_item(self, seller_id, item_type, item_id, price, comp_name=None, comp_amount=None):
+        """Выставить предмет на барахолку. item_type: 'gpu'|'cooler'|'component'"""
+        import sqlite3 as _sqlite3
+        conn2 = _sqlite3.connect('mining_bot.db', timeout=30)
+        conn2.execute('PRAGMA journal_mode=WAL')
+        try:
+            c = conn2.cursor()
+            hash_rate, cooling_power, wear, is_crafted = 0, 0, 100, 0
+
+            if item_type == 'gpu':
+                c.execute('SELECT name, hash_rate, wear, is_crafted FROM user_gpus WHERE id = ? AND user_id = ? AND is_installed = 0', (item_id, seller_id))
+                row = c.fetchone()
+                if not row:
+                    return False, "❌ Видеокарта не найдена или установлена в риг"
+                name, hash_rate, wear, is_crafted = row
+                c.execute('UPDATE user_gpus SET is_installed = 2 WHERE id = ?', (item_id,))
+
+            elif item_type == 'cooler':
+                c.execute('SELECT name, cooling_power, wear FROM user_coolers WHERE id = ? AND user_id = ? AND rig_id IS NULL', (item_id, seller_id))
+                row = c.fetchone()
+                if not row:
+                    return False, "❌ Куллер не найден или установлен в риг"
+                name, cooling_power, wear = row
+                c.execute('UPDATE user_coolers SET rig_id = -1 WHERE id = ?', (item_id,))
+
+            else:
+                return False, "❌ Неизвестный тип"
+
+            expires_at = datetime.now() + timedelta(days=3)
+            c.execute("""
+                INSERT INTO market_listings
+                (seller_id, item_type, item_id, item_name, hash_rate, cooling_power, wear, price, is_crafted, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (seller_id, item_type, item_id, name, hash_rate, cooling_power, wear, price, is_crafted, expires_at))
+
+            conn2.commit()
+            return True, c.lastrowid
+        except Exception as e:
+            logger.error(f"market_list_item error: {e}")
+            return False, str(e)
+        finally:
+            conn2.close()
+
+    def market_cancel_listing(self, listing_id, user_id):
+        """Снять предмет с барахолки"""
+        try:
+            c = self.conn.cursor()
+            c.execute('SELECT seller_id, item_type, item_id FROM market_listings WHERE id = ? AND is_active = 1', (listing_id,))
+            row = c.fetchone()
+            if not row:
+                return False, "❌ Объявление не найдено"
+            seller_id, item_type, item_id = row
+            if seller_id != user_id:
+                return False, "❌ Это не твой лот"
+            # Получаем item_name для компонентов (там хранится "🧩 Чип ×5")
+            c.execute('SELECT item_name FROM market_listings WHERE id = ?', (listing_id,))
+            name_row = c.fetchone()
+            item_name_str = name_row[0] if name_row else ""
+
+            c.execute('UPDATE market_listings SET is_active = 0 WHERE id = ?', (listing_id,))
+            if item_type == 'gpu':
+                c.execute('UPDATE user_gpus SET is_installed = 0 WHERE id = ?', (item_id,))
+            elif item_type == 'cooler':
+                c.execute('UPDATE user_coolers SET rig_id = NULL WHERE id = ?', (item_id,))
+            elif item_type == 'component':
+                # item_id = количество, comp_name из item_name "🧩 Чип ×5"
+                comp_amount = item_id
+                comp_name = item_name_str.rsplit(' ×', 1)[0] if ' ×' in item_name_str else item_name_str
+                c.execute("""INSERT INTO components (user_id, component_name, amount) VALUES (?, ?, ?)
+                             ON CONFLICT(user_id, component_name) DO UPDATE SET amount = amount + ?""",
+                          (seller_id, comp_name, comp_amount, comp_amount))
+            self.conn.commit()
+            return True, "✅ Товар снят с продажи"
+        except Exception as e:
+            return False, str(e)
+
+    def market_buy_item(self, buyer_id, listing_id):
+        """Купить предмет с барахолки"""
+        try:
+            c = self.conn.cursor()
+            c.execute("""
+                SELECT seller_id, item_type, item_id, item_name, price, hash_rate, cooling_power, wear, is_crafted
+                FROM market_listings WHERE id = ? AND is_active = 1
+            """, (listing_id,))
+            row = c.fetchone()
+            if not row:
+                return False, "❌ Лот не найден или уже продан"
+            seller_id, item_type, item_id, item_name, price, hash_rate, cooling_power, wear, is_crafted = row
+            if seller_id == buyer_id:
+                return False, "❌ Нельзя купить свой товар"
+
+            buyer = self.get_user(buyer_id)
+            if not buyer or buyer[4] < price:
+                return False, f"❌ Недостаточно тон! Нужно: {price}"
+
+            # Снимаем деньги у покупателя, отдаём продавцу
+            c.execute('UPDATE users SET gems = gems - ? WHERE user_id = ?', (price, buyer_id))
+            c.execute('UPDATE users SET gems = gems + ? WHERE user_id = ?', (price, seller_id))
+
+            # Переводим предмет покупателю
+            if item_type == 'gpu':
+                c.execute('UPDATE user_gpus SET user_id = ?, is_installed = 0 WHERE id = ?', (buyer_id, item_id))
+            elif item_type == 'cooler':
+                c.execute('UPDATE user_coolers SET user_id = ?, rig_id = NULL WHERE id = ?', (buyer_id, item_id))
+            elif item_type == 'component':
+                # item_id = количество, comp_name из item_name "🧩 Чип ×5"
+                comp_amount = item_id
+                comp_name = item_name.rsplit(' ×', 1)[0] if ' ×' in item_name else item_name
+                c.execute("""INSERT INTO components (user_id, component_name, amount) VALUES (?, ?, ?)
+                             ON CONFLICT(user_id, component_name) DO UPDATE SET amount = amount + ?""",
+                          (buyer_id, comp_name, comp_amount, comp_amount))
+
+            c.execute('UPDATE market_listings SET is_active = 0 WHERE id = ?', (listing_id,))
+            self.conn.commit()
+            return True, {"item_name": item_name, "price": price, "seller_id": seller_id, "item_type": item_type}
+        except Exception as e:
+            logger.error(f"market_buy_item error: {e}")
+            return False, str(e)
+
+    def market_get_listings(self, item_type=None, sort='price_asc', exclude_user=None, only_user=None, limit=20, offset=0):
+        """Получить лоты барахолки"""
+        c = self.conn.cursor()
+        where = ["is_active = 1", "expires_at > datetime('now')"]
+        params = []
+        if item_type:
+            where.append("item_type = ?")
+            params.append(item_type)
+        if exclude_user:
+            where.append("seller_id != ?")
+            params.append(exclude_user)
+        if only_user:
+            where.append("seller_id = ?")
+            params.append(only_user)
+
+        order = {
+            'price_asc': 'price ASC',
+            'price_desc': 'price DESC',
+            'hash_desc': 'hash_rate DESC',
+            'wear_desc': 'wear DESC',
+            'new': 'listed_at DESC',
+        }.get(sort, 'price ASC')
+
+        sql = f"SELECT * FROM market_listings WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        c.execute(sql, params)
+        return c.fetchall()
+
+    def market_expire_listings(self):
+        """Возвращает просроченные лоты продавцам"""
+        try:
+            c = self.conn.cursor()
+            c.execute("""
+                SELECT id, item_type, item_id, seller_id, item_name
+                FROM market_listings WHERE is_active = 1 AND expires_at <= datetime('now')
+            """)
+            expired = c.fetchall()
+            for listing_id, item_type, item_id, seller_id, item_name in expired:
+                c.execute('UPDATE market_listings SET is_active = 0 WHERE id = ?', (listing_id,))
+                if item_type == 'gpu':
+                    c.execute('UPDATE user_gpus SET user_id = ?, is_installed = 0 WHERE id = ?', (seller_id, item_id))
+                elif item_type == 'cooler':
+                    c.execute('UPDATE user_coolers SET user_id = ?, rig_id = NULL WHERE id = ?', (seller_id, item_id))
+                elif item_type == 'component':
+                    comp_amount = item_id
+                    comp_name = item_name.rsplit(' ×', 1)[0] if ' ×' in item_name else item_name
+                    c.execute("""INSERT INTO components (user_id, component_name, amount) VALUES (?, ?, ?)
+                                 ON CONFLICT(user_id, component_name) DO UPDATE SET amount = amount + ?""",
+                              (seller_id, comp_name, comp_amount, comp_amount))
+            self.conn.commit()
+            return len(expired)
+        except Exception as e:
+            logger.error(f"market_expire_listings error: {e}")
+            return 0
+
+    def market_get_shop_price(self, item_type, gpu_key=None, cooler_key=None):
+        """Получить цену предмета в магазине для расчёта 30%"""
+        c = self.conn.cursor()
+        if item_type == 'gpu' and gpu_key:
+            c.execute('SELECT price FROM shop_gpus WHERE gpu_key = ?', (gpu_key,))
+        elif item_type == 'cooler' and cooler_key:
+            c.execute('SELECT price FROM shop_coolers WHERE cooler_key = ?', (cooler_key,))
+        else:
+            return 0
+        row = c.fetchone()
+        return row[0] if row else 0
+
+
+    def market_list_component(self, seller_id, comp_name, qty, price_each):
+        """Выставить компоненты на барахолку"""
+        import sqlite3 as _sqlite3
+        conn2 = _sqlite3.connect('mining_bot.db', timeout=30)
+        conn2.execute('PRAGMA journal_mode=WAL')
+        try:
+            c = conn2.cursor()
+            c.execute("SELECT amount FROM components WHERE user_id = ? AND component_name = ?",
+                      (seller_id, comp_name))
+            row = c.fetchone()
+            actual = row[0] if row else 0
+            logger.info(f"market_list_component: user={seller_id} comp={comp_name!r} qty={qty} actual={actual}")
+            if actual < qty:
+                return False, f"Недостаточно: нужно {qty}, есть {actual}"
+
+            c.execute("UPDATE components SET amount = amount - ? WHERE user_id = ? AND component_name = ?",
+                      (qty, seller_id, comp_name))
+            c.execute("DELETE FROM components WHERE user_id = ? AND component_name = ? AND amount <= 0",
+                      (seller_id, comp_name))
+
+            expires_at = datetime.now() + timedelta(days=3)
+            total_price = price_each * qty
+            c.execute("""
+                INSERT INTO market_listings
+                (seller_id, item_type, item_id, item_name, hash_rate, cooling_power, wear, price, is_crafted, expires_at)
+                VALUES (?, 'component', 0, ?, ?, ?, 100, ?, 0, ?)
+            """, (seller_id, f"{comp_name} ×{qty}", float(qty), price_each, total_price, expires_at))
+            lid = c.lastrowid
+            conn2.commit()
+            return True, lid
+        except Exception as e:
+            logger.error(f"market_list_component error: {e}")
+            return False, str(e)
+        finally:
+            conn2.close()
+
+    def market_buy_component(self, buyer_id, listing_id):
+        """Купить компоненты с барахолки"""
+        try:
+            c = self.conn.cursor()
+            c.execute("""SELECT seller_id, item_name, price, hash_rate, cooling_power
+                         FROM market_listings WHERE id = ? AND is_active = 1 AND item_type = 'component'""",
+                      (listing_id,))
+            row = c.fetchone()
+            if not row:
+                return False, "❌ Лот не найден"
+            seller_id, item_name, total_price, qty, price_each = row
+            if seller_id == buyer_id:
+                return False, "❌ Нельзя купить своё"
+
+            buyer = self.get_user(buyer_id)
+            if not buyer or buyer[4] < total_price:
+                return False, f"❌ Нужно {total_price} тон"
+
+            # Извлекаем название компонента из item_name (формат "🧩 Чип ×5")
+            comp_name = item_name.rsplit(" ×", 1)[0]
+
+            c.execute("UPDATE users SET gems = gems - ? WHERE user_id = ?", (total_price, buyer_id))
+            c.execute("UPDATE users SET gems = gems + ? WHERE user_id = ?", (total_price, seller_id))
+            self.add_component(buyer_id, comp_name, int(qty))
+            c.execute("UPDATE market_listings SET is_active = 0 WHERE id = ?", (listing_id,))
+            self.conn.commit()
+            return True, {"item_name": item_name, "price": total_price, "seller_id": seller_id, "comp_name": comp_name, "qty": int(qty)}
+        except Exception as e:
+            logger.error(f"market_buy_component error: {e}")
+            return False, str(e)
 
     # ========== МЕТОДЫ ДЛЯ АВТОПОПОЛНЕНИЯ ==========
     
@@ -1972,6 +2471,242 @@ class Database:
 # Создаем экземпляр БД
 db = Database()
 
+
+# ==================== ЗАДАНИЯ (ежедневные / еженедельные) ====================
+
+import json as _json
+
+# ── Шаблоны ежедневных заданий ─────────────────────────────────────────────
+DAILY_QUEST_TEMPLATES = [
+    {"key": "mine_3",       "desc": "Сделай 3 майнинга",         "icon": "⛏",  "type": "mine",        "target": 3,   "reward_ton": 150,  "reward_exp": 30},
+    {"key": "mine_5",       "desc": "Сделай 5 майнингов",        "icon": "⛏",  "type": "mine",        "target": 5,   "reward_ton": 280,  "reward_exp": 50},
+    {"key": "mine_10",      "desc": "Сделай 10 майнингов",       "icon": "⛏",  "type": "mine",        "target": 10,  "reward_ton": 600,  "reward_exp": 100},
+    {"key": "open_box_1",   "desc": "Открой 1 бокс",             "icon": "📦",  "type": "open_box",    "target": 1,   "reward_ton": 200,  "reward_exp": 40},
+    {"key": "open_box_3",   "desc": "Открой 3 бокса",            "icon": "📦",  "type": "open_box",    "target": 3,   "reward_ton": 500,  "reward_exp": 80},
+    {"key": "earn_500",     "desc": "Заработай 500 тон за день", "icon": "💰",  "type": "earn",        "target": 500, "reward_ton": 250,  "reward_exp": 50},
+    {"key": "earn_1000",    "desc": "Заработай 1000 тон за день","icon": "💰",  "type": "earn",        "target": 1000,"reward_ton": 500,  "reward_exp": 100},
+    {"key": "daily_bonus",  "desc": "Получи ежедневный бонус",   "icon": "🎁",  "type": "daily_bonus", "target": 1,   "reward_ton": 100,  "reward_exp": 20},
+    {"key": "craft_1",      "desc": "Скрафти 1 GPU",             "icon": "⚒",  "type": "craft",       "target": 1,   "reward_ton": 400,  "reward_exp": 80},
+]
+
+# ── Шаблоны еженедельных заданий ───────────────────────────────────────────
+WEEKLY_QUEST_TEMPLATES = [
+    {"key": "w_mine_50",    "desc": "Сделай 50 майнингов",       "icon": "⛏",  "type": "mine",        "target": 50,  "reward_ton": 2000,  "reward_exp": 400},
+    {"key": "w_mine_100",   "desc": "Сделай 100 майнингов",      "icon": "⛏",  "type": "mine",        "target": 100, "reward_ton": 4000,  "reward_exp": 800},
+    {"key": "w_earn_5000",  "desc": "Заработай 5000 тон за неделю","icon": "💰","type": "earn",        "target": 5000,"reward_ton": 2500,  "reward_exp": 500},
+    {"key": "w_earn_10000", "desc": "Заработай 10000 тон за неделю","icon": "💰","type": "earn",       "target": 10000,"reward_ton": 5000, "reward_exp": 1000},
+    {"key": "w_open_10",    "desc": "Открой 10 боксов",          "icon": "📦",  "type": "open_box",    "target": 10,  "reward_ton": 2000,  "reward_exp": 400},
+    {"key": "w_streak_7",   "desc": "Стрик 7 дней подряд",       "icon": "🔥",  "type": "streak",      "target": 7,   "reward_ton": 3000,  "reward_exp": 600},
+    {"key": "w_buy_gpu",    "desc": "Купи любую GPU",            "icon": "🖼",  "type": "buy_gpu",     "target": 1,   "reward_ton": 1500,  "reward_exp": 300},
+    {"key": "w_buy_asic",   "desc": "Купи любой ASIC",           "icon": "⚡",  "type": "buy_asic",    "target": 1,   "reward_ton": 3000,  "reward_exp": 600},
+    {"key": "w_craft_3",    "desc": "Скрафти 3 GPU",             "icon": "⚒",  "type": "craft",       "target": 3,   "reward_ton": 3000,  "reward_exp": 600},
+    {"key": "w_referral",   "desc": "Пригласи реферала",         "icon": "👥",  "type": "referral",    "target": 1,   "reward_ton": 4000,  "reward_exp": 800},
+]
+
+
+def _get_week_start():
+    """Понедельник текущей недели (YYYY-MM-DD)."""
+    today = datetime.now().date()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def _pick_quests(templates, n, seed_str):
+    """Выбирает n заданий из шаблонов детерминированно по seed."""
+    import hashlib
+    h = int(hashlib.md5(seed_str.encode()).hexdigest(), 16)
+    idxs = []
+    pool = list(range(len(templates)))
+    while len(idxs) < n and pool:
+        i = h % len(pool)
+        idxs.append(pool.pop(i))
+        h = h * 6364136223846793005 + 1442695040888963407
+    return [templates[i] for i in idxs]
+
+
+def get_user_quests(user_id: int) -> dict:
+    """
+    Возвращает {
+      "daily": [{"key","desc","icon","type","target","reward_ton","reward_exp","progress","done","claimed"},...],
+      "weekly": [...],
+      "daily_date": "YYYY-MM-DD",
+      "weekly_start": "YYYY-MM-DD"
+    }
+    Автоматически обновляет задания при смене дня/недели.
+    """
+    today = datetime.now().date().isoformat()
+    week_start = _get_week_start()
+
+    c = db.conn.cursor()
+    c.execute(
+        "SELECT quest_data FROM user_quests WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    data = _json.loads(row[0]) if row else {}
+
+    changed = False
+
+    # Обновляем ежедневные
+    if data.get("daily_date") != today:
+        seed = f"daily:{user_id}:{today}"
+        chosen = _pick_quests(DAILY_QUEST_TEMPLATES, 3, seed)
+        data["daily"] = [
+            {**q, "progress": 0, "done": False, "claimed": False}
+            for q in chosen
+        ]
+        data["daily_date"] = today
+        changed = True
+
+    # Обновляем еженедельные
+    if data.get("weekly_start") != week_start:
+        seed = f"weekly:{user_id}:{week_start}"
+        chosen = _pick_quests(WEEKLY_QUEST_TEMPLATES, 3, seed)
+        data["weekly"] = [
+            {**q, "progress": 0, "done": False, "claimed": False}
+            for q in chosen
+        ]
+        data["weekly_start"] = week_start
+        changed = True
+
+    if changed:
+        _save_quests(user_id, data)
+
+    return data
+
+
+def _save_quests(user_id: int, data: dict):
+    c = db.conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO user_quests (user_id, quest_data) VALUES (?,?)",
+        (user_id, _json.dumps(data, ensure_ascii=False)))
+    db.conn.commit()
+
+
+def advance_quest(user_id: int, quest_type: str, amount: int = 1):
+    """Продвинуть прогресс всех незавершённых заданий данного типа."""
+    data = get_user_quests(user_id)
+    changed = False
+    for group in ("daily", "weekly"):
+        for q in data.get(group, []):
+            if q["type"] == quest_type and not q["done"]:
+                q["progress"] = min(q["progress"] + amount, q["target"])
+                if q["progress"] >= q["target"]:
+                    q["done"] = True
+                changed = True
+    if changed:
+        _save_quests(user_id, data)
+
+
+async def _show_quests(user_id: int, target, group: str = "daily"):
+    data = get_user_quests(user_id)
+    quests = data.get(group, [])
+    title = "📋 <b>Ежедневные задания</b>" if group == "daily" else "📅 <b>Еженедельные задания</b>"
+
+    if group == "daily":
+        reset_label = "Сброс в полночь"
+    else:
+        mon = _get_week_start()
+        reset_label = f"Сброс в понедельник (с {mon})"
+
+    lines = [title, f"<i>{reset_label}</i>", ""]
+
+    for i, q in enumerate(quests):
+        bar_filled = int(q["progress"] / q["target"] * 10) if q["target"] else 10
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        pct = int(q["progress"] / q["target"] * 100) if q["target"] else 100
+        status = "✅" if q["done"] else ("🎁" if False else "▶️")
+        claimed = " <i>(получено)</i>" if q["claimed"] else ""
+        line = q["icon"] + " <b>" + q["desc"] + "</b>" + claimed + "\n"
+        line += "  " + bar + " " + str(pct) + "%"
+        line += "  (" + str(q["progress"]) + "/" + str(q["target"]) + ")\n"
+        rton = str(q["reward_ton"])
+        rexp = str(q["reward_exp"])
+        line += "  +" + rton + " ton  +" + rexp + " exp"
+        if q["done"]:
+            line += " " + status
+        lines.append(line)
+
+    text = "\n".join(lines)
+
+
+    # Кнопки получить награду
+    buttons = []
+    for i, q in enumerate(quests):
+        if q["done"] and not q["claimed"]:
+            buttons.append([InlineKeyboardButton(
+                text=f"🎁 Получить: {q['desc'][:25]}",
+                callback_data=f"quest_claim:{group}:{i}"
+            )])
+
+    nav = []
+    if group == "daily":
+        nav.append(InlineKeyboardButton(text="📅 Еженедельные", callback_data="quests_weekly"))
+    else:
+        nav.append(InlineKeyboardButton(text="📋 Ежедневные", callback_data="quests"))
+    nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data="profile"))
+    buttons.append(nav)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        try:
+            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.message(Command("quests"))
+async def cmd_quests(message: Message):
+    if await check_ban(message.from_user.id):
+        await send_ban_message(message)
+        return
+    await _show_quests(message.from_user.id, message, "daily")
+
+
+@dp.callback_query(F.data == "quests")
+async def cb_quests(callback: CallbackQuery):
+    await callback.answer()
+    await _show_quests(callback.from_user.id, callback, "daily")
+
+
+@dp.callback_query(F.data == "quests_weekly")
+async def cb_quests_weekly(callback: CallbackQuery):
+    await callback.answer()
+    await _show_quests(callback.from_user.id, callback, "weekly")
+
+
+@dp.callback_query(F.data.startswith("quest_claim:"))
+async def cb_quest_claim(callback: CallbackQuery):
+    await callback.answer()
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        return
+    _, group, idx_str = parts
+    idx = int(idx_str)
+
+    data = get_user_quests(callback.from_user.id)
+    quests = data.get(group, [])
+    if idx >= len(quests):
+        return
+    q = quests[idx]
+    if not q["done"] or q["claimed"]:
+        await callback.answer("❌ Нельзя получить эту награду", show_alert=True)
+        return
+
+    q["claimed"] = True
+    _save_quests(callback.from_user.id, data)
+
+    db.add_gems(callback.from_user.id, q["reward_ton"])
+    db.cursor.execute(
+        "UPDATE users SET exp=exp+? WHERE user_id=?",
+        (q["reward_exp"], callback.from_user.id))
+    db.conn.commit()
+
+    await callback.answer(
+        f"✅ Получено: +{q['reward_ton']} тон, +{q['reward_exp']} опыта!", show_alert=True)
+    await _show_quests(callback.from_user.id, callback, group)
+
+
 # ==================== ФУНКЦИИ ДЛЯ ИКОНОК ====================
 def get_level_icon(level):
     if level < 10:
@@ -2070,6 +2805,7 @@ def get_main_keyboard():
             InlineKeyboardButton(text="🌟 Уровень", callback_data="level"),
             InlineKeyboardButton(text="🪙 Донат", callback_data="donate_menu")
         ],
+        [InlineKeyboardButton(text="🏪 Барахолка", callback_data="market")],
         [InlineKeyboardButton(text="➕ Добавить бота в группу", url=f"https://t.me/{config.BOT_USERNAME}?startgroup=true")]
     ])
     return keyboard
@@ -2137,7 +2873,8 @@ def get_profile_keyboard(target_user_id=None):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📦 Склад", callback_data="my_storage"),
              InlineKeyboardButton(text="💿 Мои майнеры", callback_data="my_rigs")],
-            [InlineKeyboardButton(text="⚙️ Настройки", callback_data="profile_settings")],
+            [InlineKeyboardButton(text="📋 Задания", callback_data="quests"),
+             InlineKeyboardButton(text="⚙️ Настройки", callback_data="profile_settings")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
         ])
     return keyboard
@@ -2719,12 +3456,7 @@ def get_install_cooler_keyboard(user_id, rig_id, slot_index, coolers, page=0):
 def get_asic_detail_keyboard(asic_id, is_broken=False):
     """Клавиатура для детальной информации о ASIC"""
     buttons = []
-    
-    if is_broken:
-        buttons.append([InlineKeyboardButton(text="🔧 Починить", callback_data=f"repair_asic_{asic_id}")])
-    
     buttons.append([InlineKeyboardButton(text="◀️ Назад к списку", callback_data="my_cards")])
-    
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ==================== СОСТОЯНИЯ FSM ====================
@@ -2751,6 +3483,13 @@ class UserStates(StatesGroup):
     check_comment = State()
     # Активация чека
     activate_check_code = State()
+    # Анкета
+    profile_about = State()
+
+    profile_birthday = State()
+    profile_city = State()
+    profile_gender = State()
+
 
 # ==================== ФОНОВАЯ ЗАДАЧА ====================
 async def auto_restock_scheduler():
@@ -2783,7 +3522,8 @@ async def auto_restock_scheduler():
 # ==================== ОБРАБОТЧИКИ КОМАНД ====================
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     args = message.text.split()
     referrer_id = None
 
@@ -2914,6 +3654,12 @@ async def cmd_mine(message: Message):
         keyboard = None
 
     await message.answer(result, reply_markup=keyboard, parse_mode="HTML")
+    if success:
+        advance_quest(message.from_user.id, "mine")
+        # earn — считаем по base_ton из result (упрощённо через daily_mines)
+        _u2 = db.get_user(message.from_user.id)
+        if _u2:
+            _dm = _u2[-1] if _u2 else 0  # daily_mines — последняя колонка
 
 @dp.message(Command("nick"))
 async def cmd_nick(message: Message):
@@ -2943,7 +3689,8 @@ async def cmd_nick(message: Message):
     await message.answer(result, parse_mode="HTML")
 
 @dp.message(Command("profile"))
-async def cmd_profile(message: Message):
+async def cmd_profile(message: Message, state: FSMContext):
+    await state.clear()
     if await check_ban(message.from_user.id):
         await send_ban_message(message)
         return
@@ -2976,6 +3723,9 @@ async def cmd_daily(message: Message):
             f"{streak_icon} <b>Стрик:</b> {streak} дней\n"
             f"{extra}"
         )
+        await message.answer(text, reply_markup=get_back_to_menu_keyboard(), parse_mode="HTML")
+        advance_quest(message.from_user.id, "daily_bonus")
+        return
     else:
         db.cursor.execute('SELECT last_bonus FROM daily_bonus WHERE user_id = ?', (message.from_user.id,))
         result = db.cursor.fetchone()
@@ -3235,9 +3985,7 @@ async def cmd_inventory(message: Message):
     text += f"(в ригах: {cooler_installed}, свободно: {cooler_free})\n"
     
     # ASIC
-    asic_broken = len([a for a in asics if a[5] <= 20]) if asics else 0
-    text += f"💽 ASIC-майнеры: {len(asics) if asics else 0} шт. "
-    text += f"(сломано: {asic_broken})\n"
+    text += f"💽 ASIC-майнеры: {len(asics) if asics else 0} шт.\n"
     
     # Риги
     text += f"💿 GPU-риги: {len(rigs) if rigs else 0} шт.\n\n"
@@ -3444,6 +4192,9 @@ async def callback_daily(callback: CallbackQuery):
             f"{streak_icon} <b>Стрик:</b> {streak} дней\n"
             f"{extra}"
         )
+        await message.answer(text, reply_markup=get_back_to_menu_keyboard(), parse_mode="HTML")
+        advance_quest(message.from_user.id, "daily_bonus")
+        return
     else:
         db.cursor.execute('SELECT last_bonus FROM daily_bonus WHERE user_id = ?', (callback.from_user.id,))
         result = db.cursor.fetchone()
@@ -3817,7 +4568,7 @@ async def callback_buy_asic(callback: CallbackQuery):
         f"📊 <b>Характеристики:</b>\n"
         f" ⤷{power_icon} Хешрейт ›› {asic['hash_rate']} MH/s\n"
         f" ⤷⚡ Энергопотребление ›› {asic['power']} Вт\n"
-        f" ⤷🔧 Скорость износа ›› {asic['wear_rate']}/час\n"
+
         f" ⤷🔊 Шум ›› {asic['noise']} дБ\n\n"
         f"💰 <b>Твой баланс ››</b> {user_balance} тон"
     )
@@ -4051,15 +4802,36 @@ async def callback_my_rigs(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
+
+    await callback.answer()
     rigs = db.get_user_rigs(callback.from_user.id)
-    
-    if not rigs:
-        text = "💿 <b>У тебя пока нет GPU-ригов!</b>"
-        await callback.message.edit_text(text, reply_markup=get_profile_keyboard(), parse_mode="HTML")
-    else:
-        text = "💿 <b>Твои GPU-риги</b>\n\nВыбери риг для настройки:"
+    asics = db.get_user_asics(callback.from_user.id)
+
+    text = "💿 <b>Мои майнеры</b>\n\n"
+
+    if asics:
+        text += f"<b>💽 ASIC-майнеры ({len(asics)} шт.):</b>\n"
+        for asic in asics:
+            text += f"  ✅ {asic[3]} — {asic[4]} HM/s\n"
+        text += "\n"
+
+    if rigs:
+        text += f"<b>💿 GPU-риги ({len(rigs)} шт.):</b>\nВыбери риг для настройки:"
         await callback.message.edit_text(text, reply_markup=get_rigs_keyboard(callback.from_user.id, rigs, 0), parse_mode="HTML")
+    elif asics:
+        text += "<i>GPU-ригов нет. Купи в /shop</i>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop_menu")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")]
+        ])
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        text = "💿 <b>У тебя пока нет майнеров!</b>\n\nКупи ASIC или GPU-риг в магазине."
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛒 Магазин", callback_data="shop_menu")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="profile")]
+        ])
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("rig_detail_"))
 async def callback_rig_detail(callback: CallbackQuery):
@@ -4457,48 +5229,7 @@ async def callback_repair_cooler(callback: CallbackQuery):
         callback.data = f"rig_cooler_slot_{rig_id}_{slot_index}"
         await callback_rig_cooler_slot(callback)
 
-@dp.callback_query(F.data.startswith("repair_asic_"))
-async def callback_repair_asic(callback: CallbackQuery):
-    if await check_ban(callback.from_user.id):
-        await send_ban_message(callback)
-        return
-    
-    asic_id = int(callback.data.split("_")[2])
-    
-    asic = db.get_asic_by_id(asic_id)
-    if not asic or asic[1] != callback.from_user.id:
-        await callback.answer("❌ Этот ASIC тебе не принадлежит!", show_alert=True)
-        return
-    
-    if asic[5] >= 100:
-        await callback.answer("✅ ASIC уже в идеальном состоянии!", show_alert=True)
-        return
-    
-    repair_cost = config.REPAIR_COST
-    
-    user = db.get_user(callback.from_user.id)
-    if user[4] < repair_cost:
-        await callback.answer(f"❌ Недостаточно тон! Нужно {repair_cost}", show_alert=True)
-        return
-    
-    # Списываем деньги
-    db.remove_gems(callback.from_user.id, repair_cost, callback.from_user.id)
-    
-    # Чиним ASIC
-    db.repair_asic(asic_id)
-    
-    # Восстанавливаем работоспособность
-    db.cursor.execute('UPDATE user_asics SET is_working = 1 WHERE id = ?', (asic_id,))
-    db.conn.commit()
-    
-    # Пересчитываем хешрейт
-    db.recalculate_user_hashrate(callback.from_user.id)
-    
-    await callback.answer("✅ ASIC отремонтирован!", show_alert=False)
-    
-    # Возвращаемся к деталям
-    callback.data = f"mycard_detail_asic_{asic_id}"
-    await callback_asic_detail(callback)
+# repair_asic удалён — ASIC не ломаются
 
 @dp.callback_query(F.data == "stats")
 async def callback_stats(callback: CallbackQuery):
@@ -4665,7 +5396,8 @@ async def callback_track_referrals(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
+
+    await callback.answer()
     user = db.get_user(callback.from_user.id)
     referrals = db.get_user_referrals(callback.from_user.id)
     referrals_count = user[6] if user[6] is not None else 0
@@ -4729,62 +5461,73 @@ async def callback_track_referrals(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "my_storage")
 async def callback_my_storage(callback: CallbackQuery):
-    """Показывает склад с видеокартами и куллерами"""
+    """Показывает склад с компонентами, видеокартами и куллерами"""
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
+
     await callback.answer()
-    
-    # Получаем видеокарты пользователя (не установленные в риги)
+
     gpus = db.get_free_gpus(callback.from_user.id)
-    
-    # Получаем куллеры пользователя (не установленные в риги)
     coolers = db.get_free_coolers(callback.from_user.id)
-    
+    components = {c[0]: c[1] for c in db.get_user_components(callback.from_user.id)}
+
     text = "📦 <b>Твой склад</b>\n\n"
-    
-    if not gpus and not coolers:
-        text += "У тебя пока нет свободного оборудования.\n"
-        text += "Купи видеокарты или куллеры в магазине: /shop"
-        keyboard = get_back_to_menu_keyboard()
+
+    # Компоненты всегда вверху
+    COMP_ICONS = {
+        "🧩 Чип": "🧩", "⚙️ Вентилятор": "⚙️",
+        "🔌 Кабель": "🔌", "🛡️ Радиатор": "🛡️", "💾 Микросхема": "💾"
+    }
+    total_comps = sum(components.values())
+    text += f"<b>🔩 Компоненты для крафта ({total_comps} шт.):</b>\n"
+    if components:
+        for comp_name, icon in COMP_ICONS.items():
+            amt = components.get(comp_name, 0)
+            text += f"  {icon} {comp_name.split(' ', 1)[1]}: <b>{amt}</b>\n"
     else:
-        # Показываем видеокарты
-        if gpus:
-            text += f"<b>🖼 Видеокарты ({len(gpus)} шт.):</b>\n"
-            for i, gpu in enumerate(gpus[:5], 1):
-                try:
-                    is_broken = len(gpu) > 5 and gpu[5] is not None and gpu[5] <= 20
-                    status = "⚠️" if is_broken else "✅"
-                    text += f"  {status} {gpu[3]} - {gpu[4]} MH/s ({gpu[5]}%)\n"
-                except:
-                    continue
-            if len(gpus) > 5:
-                text += f"  ... и ещё {len(gpus) - 5} видеокарт\n"
-            text += "\n"
-        
-        # Показываем куллеры
-        if coolers:
-            text += f"<b>💨 Куллеры ({len(coolers)} шт.):</b>\n"
-            for i, cooler in enumerate(coolers[:5], 1):
-                try:
-                    is_broken = len(cooler) > 5 and cooler[5] is not None and cooler[5] <= 20
-                    status = "⚠️" if is_broken else "✅"
-                    text += f"  {status} {cooler[3]} - мощность {cooler[4]} ({cooler[5]}%)\n"
-                except:
-                    continue
-            if len(coolers) > 5:
-                text += f"  ... и ещё {len(coolers) - 5} куллеров\n"
-        
-        text += "\nИспользуй /inventory для просмотра всего оборудования"
-        
-        # Клавиатура с кнопками
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🖼 Все видеокарты", callback_data="my_gpus")],
-            [InlineKeyboardButton(text="💨 Все куллеры", callback_data="my_coolers")],
-            [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile")]
-        ])
-    
+        text += "  Нет компонентов — открывай боксы\n"
+    text += "\n"
+
+    # Видеокарты
+    if gpus:
+        text += f"<b>🖼 Видеокарты ({len(gpus)} шт.):</b>\n"
+        for gpu in gpus[:5]:
+            try:
+                is_broken = gpu[5] is not None and gpu[5] <= 20
+                status = "⚠️" if is_broken else "✅"
+                craft_tag = " ⚒️" if (len(gpu) > 9 and gpu[9]) else ""
+                text += f"  {status} {gpu[3]}{craft_tag} — {gpu[4]} HM/s ({gpu[5]}%)\n"
+            except:
+                continue
+        if len(gpus) > 5:
+            text += f"  ... и ещё {len(gpus) - 5}\n"
+        text += "\n"
+
+    # Куллеры
+    if coolers:
+        text += f"<b>💨 Куллеры ({len(coolers)} шт.):</b>\n"
+        for cooler in coolers[:5]:
+            try:
+                is_broken = cooler[5] is not None and cooler[5] <= 20
+                status = "⚠️" if is_broken else "✅"
+                text += f"  {status} {cooler[3]} — мощн. {cooler[4]} ({cooler[5]}%)\n"
+            except:
+                continue
+        if len(coolers) > 5:
+            text += f"  ... и ещё {len(coolers) - 5}\n"
+
+    if not gpus and not coolers:
+        text += "<i>Нет свободного оборудования. Купи в /shop</i>"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Все видеокарты", callback_data="my_gpus"),
+         InlineKeyboardButton(text="💨 Все куллеры", callback_data="my_coolers")],
+        [InlineKeyboardButton(text="⚒️ Крафт", callback_data="craft_menu"),
+         InlineKeyboardButton(text="🏪 Барахолка", callback_data="market")],
+        [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile")]
+    ])
+
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 @dp.callback_query(F.data == "my_gpus")
@@ -4793,29 +5536,27 @@ async def callback_my_gpus(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
     await callback.answer()
-    
-    gpus = db.get_user_gpus(callback.from_user.id, include_installed=True)
-    
-    if not gpus:
+    try:
+        gpus = db.get_user_gpus(callback.from_user.id, include_installed=True)
+        # Исключаем карты на барахолке (is_installed=2)
+        gpus = [g for g in gpus if len(g) <= 6 or g[6] != 2]
+        if not gpus:
+            await callback.message.edit_text(
+                "🖼 У тебя нет видеокарт!",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            return
+        items = [('gpu', gpu) for gpu in gpus]
+        text = "🖼 <b>Твои видеокарты</b>\n\nВыбери видеокарту для просмотра:"
         await callback.message.edit_text(
-            "🖼 У тебя нет видеокарт!",
-            reply_markup=get_profile_keyboard()
+            text,
+            reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
+            parse_mode="HTML"
         )
-        return
-    
-    # Преобразуем в формат для клавиатуры
-    items = [('gpu', gpu) for gpu in gpus]
-    
-    text = "🖼 <b>Твои видеокарты</b>\n\n"
-    text += "Выбери видеокарту для просмотра:"
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
-        parse_mode="HTML"
-    )
+    except Exception as e:
+        logger.error(f"callback_my_gpus error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка загрузки: {e}", reply_markup=get_back_to_menu_keyboard())
 
 @dp.callback_query(F.data == "my_coolers")
 async def callback_my_coolers(callback: CallbackQuery):
@@ -4823,29 +5564,27 @@ async def callback_my_coolers(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
     await callback.answer()
-    
-    coolers = db.get_user_coolers(callback.from_user.id, include_installed=True)
-    
-    if not coolers:
+    try:
+        coolers = db.get_user_coolers(callback.from_user.id, include_installed=True)
+        # Исключаем куллеры на барахолке (rig_id = -1)
+        coolers = [c for c in coolers if len(c) <= 7 or c[7] != -1]
+        if not coolers:
+            await callback.message.edit_text(
+                "💨 У тебя нет куллеров!",
+                reply_markup=get_back_to_menu_keyboard()
+            )
+            return
+        items = [('cooler', cooler) for cooler in coolers]
+        text = "💨 <b>Твои куллеры</b>\n\nВыбери куллер для просмотра:"
         await callback.message.edit_text(
-            "💨 У тебя нет куллеров!",
-            reply_markup=get_profile_keyboard()
+            text,
+            reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
+            parse_mode="HTML"
         )
-        return
-    
-    # Преобразуем в формат для клавиатуры
-    items = [('cooler', cooler) for cooler in coolers]
-    
-    text = "💨 <b>Твои куллеры</b>\n\n"
-    text += "Выбери куллер для просмотра:"
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
-        parse_mode="HTML"
-    )
+    except Exception as e:
+        logger.error(f"callback_my_coolers error: {e}")
+        await callback.message.edit_text(f"❌ Ошибка загрузки: {e}", reply_markup=get_back_to_menu_keyboard())
 
 @dp.callback_query(F.data == "my_cards")
 async def callback_my_cards(callback: CallbackQuery):
@@ -4943,55 +5682,104 @@ async def callback_mycards_page(callback: CallbackQuery):
         parse_mode="HTML"
     )
 
+def get_gpu_detail_keyboard(gpu_id, is_broken, is_installed, rig_id):
+    """Клавиатура для детального просмотра видеокарты"""
+    buttons = []
+    if is_broken:
+        buttons.append([InlineKeyboardButton(text="🔧 Починить", callback_data=f"repair_gpu_{gpu_id}")])
+    if is_installed and rig_id:
+        # Карта в риге - нужно знать slot_index для вытаскивания
+        # Получим его из колонки slot_index
+        buttons.append([InlineKeyboardButton(text="📤 Вытащить из рига", callback_data=f"gpu_pull_{gpu_id}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="my_gpus")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_cooler_detail_keyboard(cooler_id, is_broken, is_installed, rig_id):
+    """Клавиатура для детального просмотра куллера"""
+    buttons = []
+    if is_broken:
+        buttons.append([InlineKeyboardButton(text="🔧 Починить", callback_data=f"repair_cooler_{cooler_id}")])
+    if is_installed and rig_id:
+        buttons.append([InlineKeyboardButton(text="📤 Вытащить из рига", callback_data=f"cooler_pull_{cooler_id}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="my_coolers")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.callback_query(F.data.startswith("mycard_detail_gpu_"))
 async def callback_gpu_detail(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
-    gpu_id = int(callback.data.split("_")[3])
-    
-    gpu = db.get_gpu_by_id(gpu_id)
-    if not gpu:
-        await callback.message.edit_text("❌ Видеокарта не найдена!")
+    await callback.answer()
+    try:
+        # "mycard_detail_gpu_123" -> split("_") = [mycard, detail, gpu, 123]
+        parts = callback.data.split("_")
+        gpu_id = int(parts[-1])
+    except (IndexError, ValueError) as e:
+        await callback.message.edit_text(f"❌ Ошибка: {callback.data} -> {e}")
         return
     
-    is_broken = len(gpu) > 5 and gpu[5] is not None and gpu[5] <= 20
-    status = "⚠️ СЛОМАНА" if is_broken else "✅ РАБОЧАЯ"
-    is_installed = gpu[6] == 1
-    rig_id = gpu[7] if is_installed else None
-    
-    detail_text = (
-        f"🖼 <b>{gpu[3]}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 <b>Характеристики:</b>\n"
-        f" ⤷⚡ Хешрейт ›› {gpu[4]} MH/s\n"
-        f" ⤷🔧 Состояние ›› {status} ({gpu[5]}%)\n"
-    )
-    
-    if is_installed:
-        detail_text += f" ⤷📌 Установлена в риг #{rig_id}\n"
-    
-    if is_broken:
-        detail_text += f"\n⚠️ Карта сломана! Требуется ремонт."
-    
-    # Кнопки
-    from keyboards.rigs import get_gpu_detail_keyboard
-    keyboard = get_gpu_detail_keyboard(gpu_id, is_broken, is_installed, rig_id)
-    
-    await callback.message.edit_text(
-        detail_text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    try:
+        gpu = db.get_gpu_by_id(gpu_id)
+        if not gpu:
+            await callback.message.edit_text("❌ Видеокарта не найдена!")
+            return
 
+        is_broken = len(gpu) > 5 and gpu[5] is not None and gpu[5] <= 20
+        status = "⚠️ СЛОМАНА" if is_broken else "✅ РАБОЧАЯ"
+        is_installed = gpu[6] == 1
+        rig_id = gpu[7] if is_installed else None
+        craft_tag = " ⚒️" if (len(gpu) > 9 and gpu[9]) else ""
+
+        detail_text = (
+            f"🖼 <b>{gpu[3]}</b>{craft_tag}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 <b>Характеристики:</b>\n"
+            f" ⤷⚡ Хешрейт ›› {gpu[4]} MH/s\n"
+            f" ⤷🔧 Состояние ›› {status} ({gpu[5]}%)\n"
+        )
+        if is_installed:
+            detail_text += f" ⤷📌 Установлена в риг #{rig_id}\n"
+        if is_broken:
+            detail_text += f"\n⚠️ Карта сломана! Требуется ремонт."
+
+        keyboard = get_gpu_detail_keyboard(gpu_id, is_broken, is_installed, rig_id)
+
+        if not is_installed and gpu[6] == 0:
+            try:
+                c_price = db.conn.cursor()
+                c_price.execute("SELECT gpu_key FROM user_gpus WHERE id = ?", (gpu_id,))
+                gkey_row = c_price.fetchone()
+                if gkey_row:
+                    shop_price = db.market_get_shop_price("gpu", gpu_key=gkey_row[0])
+                    quick_price = int(shop_price * 0.3) if shop_price else 0
+                    if quick_price > 0:
+                        kb_rows = list(keyboard.inline_keyboard)
+                        kb_rows.append([InlineKeyboardButton(
+                            text=f"💸 Быстрая продажа: {quick_price} тон (30%)",
+                            callback_data=f"mkt_quick_sell_gpu:{gpu_id}:{quick_price}"
+                        )])
+                        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+            except Exception:
+                pass
+
+        await callback.message.edit_text(detail_text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"gpu_detail error gpu_id={gpu_id}: {e}", exc_info=True)
+        await callback.message.edit_text(f"❌ Ошибка открытия карты: {e}")
 @dp.callback_query(F.data.startswith("mycard_detail_cooler_"))
 async def callback_cooler_detail(callback: CallbackQuery):
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
-    cooler_id = int(callback.data.split("_")[3])
+    await callback.answer()
+    try:
+        parts = callback.data.split("_")
+        cooler_id = int(parts[-1])
+    except (IndexError, ValueError) as e:
+        await callback.message.edit_text(f"❌ Ошибка: {callback.data} -> {e}")
+        return
     
     cooler = db.get_cooler_by_id(cooler_id)
     if not cooler:
@@ -5018,9 +5806,24 @@ async def callback_cooler_detail(callback: CallbackQuery):
         detail_text += f"\n⚠️ Куллер сломан! Требуется ремонт."
     
     # Кнопки
-    from keyboards.rigs import get_cooler_detail_keyboard
     keyboard = get_cooler_detail_keyboard(cooler_id, is_broken, is_installed, rig_id)
-    
+
+    # Кнопка быстрой продажи 30% только если свободна
+    if not is_installed and (cooler[6] == 0 if len(cooler) > 6 else True):
+        c_price2 = db.conn.cursor()
+        c_price2.execute("SELECT cooler_key, rig_id FROM user_coolers WHERE id = ?", (cooler_id,))
+        crow = c_price2.fetchone()
+        if crow and crow[1] is None:
+            shop_price2 = db.market_get_shop_price("cooler", cooler_key=crow[0])
+            quick_price2 = int(shop_price2 * 0.3) if shop_price2 else 0
+            if quick_price2 > 0:
+                kb_rows2 = list(keyboard.inline_keyboard)
+                kb_rows2.append([InlineKeyboardButton(
+                    text=f"💸 Быстрая продажа: {quick_price2} тон (30%)",
+                    callback_data=f"mkt_quick_sell_cooler:{cooler_id}:{quick_price2}"
+                )])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=kb_rows2)
+
     await callback.message.edit_text(
         detail_text,
         reply_markup=keyboard,
@@ -5517,7 +6320,7 @@ async def callback_change_nickname_inline(callback: CallbackQuery, state: FSMCon
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-@dp.message(UserStates.waiting_for_nickname)
+@dp.message(UserStates.waiting_for_nickname, F.text[0] != "/")
 async def process_nickname_change(message: Message, state: FSMContext):
     """Обрабатываем ввод нового ника"""
     await state.clear()
@@ -5543,70 +6346,252 @@ async def process_nickname_change(message: Message, state: FSMContext):
     await message.answer(result, reply_markup=keyboard, parse_mode="HTML")
 
 
+def build_questionnaire_text(user, profile, admin_tag=""):
+    """Формирует текст анкеты"""
+    created_at = datetime.fromisoformat(user[12])
+    reg_str = created_at.strftime("%d.%m.%Y в %H:%M:%S")
+    days_in_game = (datetime.now() - created_at).days
+
+    # profile: user_id, birthday, gender, about, city, show_birthday
+    birthday = profile[1] if profile and profile[1] else None
+    gender_raw = profile[2] if profile and profile[2] else None
+    about = profile[3] if profile and profile[3] else None
+    city = profile[4] if profile and profile[4] else None
+    show_bday = profile[5] if profile and profile[5] is not None else 1
+
+    gender_icons = {"male": "♂️ Мужской", "female": "♀️ Женский", "other": "⚧️ Другой"}
+    gender_str = gender_icons.get(gender_raw, "—")
+
+    privilege, _ = db.get_user_privilege(user[0])
+    priv_data = config.PRIVILEGES.get(privilege, config.PRIVILEGES["player"])
+
+    text = f"📋 <b>Твоя анкета:</b>\n\n<blockquote>"
+    text += f"✏️ Регистрация » {reg_str}\n\n"
+    text += f"🖊 Никнейм » <b>{escape_html(user[3])}</b>{admin_tag}\n"
+    text += f"🏙 Город » {escape_html(city) if city else '—'}\n"
+
+    if show_bday and birthday:
+        text += f"🗓 Дата рождения » {birthday}\n"
+    elif not show_bday:
+        text += f"🗓 Дата рождения » <i>скрыта</i>\n"
+    else:
+        text += f"🗓 Дата рождения » —\n"
+
+    text += f"  └ Пол » {gender_str}\n\n"
+
+    text += f"📝 О себе »\n"
+    if about:
+        text += f"\n{escape_html(about)}\n\n"
+    else:
+        text += f"\n<i>не заполнено</i>\n\n"
+
+    text += f"{priv_data['icon']} Статус » {priv_data['name']}\n"
+    text += f"📅 Дней в игре » {days_in_game}\n"
+    text += f"</blockquote>"
+    return text
+
+
 @dp.callback_query(F.data == "profile_questionnaire")
 async def callback_profile_questionnaire(callback: CallbackQuery):
     """Анкета игрока"""
     if await check_ban(callback.from_user.id):
         await send_ban_message(callback)
         return
-    
     await callback.answer()
-    
+
     user = db.get_user(callback.from_user.id)
     if not user:
         await callback.answer("❌ Ошибка!", show_alert=True)
         return
-    
-    level = user[10] if user[10] is not None else 1
-    exp = user[11] if user[11] is not None else 0
-    ton = int(user[4]) if user[4] is not None else 0
-    hash_rate = float(user[5]) if user[5] is not None else 0.0
-    referrals = user[6] if user[6] is not None else 0
-    total_mined = float(user[14]) if len(user) > 14 and user[14] is not None else 0
-    boxes_count = user[16] if len(user) > 16 and user[16] is not None else 0
-    privilege, until = db.get_user_privilege(callback.from_user.id)
-    
-    # Получаем оборудование
-    asics = db.get_user_asics(callback.from_user.id)
-    rigs = db.get_user_rigs(callback.from_user.id)
-    gpus = db.get_user_gpus(callback.from_user.id, include_installed=True)
-    
-    priv_data = config.PRIVILEGES.get(privilege, config.PRIVILEGES["player"])
-    priv_icon = priv_data["icon"]
-    priv_name = priv_data["name"]
-    
-    created_at = datetime.fromisoformat(user[12])
-    days_in_game = (datetime.now() - created_at).days
-    
-    text = (
-        f"📋 <b>Анкета игрока</b>\n\n"
-        f"<blockquote>"
-        f"👤 Ник: <b>{escape_html(user[3])}</b>\n"
-        f"🆔 MID: <b>{user[1]}</b>\n"
-        f"{priv_icon} Статус: <b>{priv_name}</b>\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Прогресс:</b>\n"
-        f"├ {get_level_icon(level)} Уровень: {level}\n"
-        f"├ ✨ Опыт: {exp}\n"
-        f"├ 📅 Дней в игре: {days_in_game}\n\n"
-        f"💰 <b>Финансы:</b>\n"
-        f"├ 💰 Баланс: {ton} тон\n"
-        f"├ ⛏ Всего намайнено: {total_mined:.0f} тон\n"
-        f"└ ⚡ Хешрейт: {hash_rate:.1f} MH/s\n\n"
-        f"🖥 <b>Оборудование:</b>\n"
-        f"├ 💽 ASIC-майнеров: {len(asics)}\n"
-        f"├ 💿 GPU-ригов: {len(rigs)}\n"
-        f"├ 🖼 Видеокарт: {len(gpus)}\n"
-        f"└ 📦 Коробок: {boxes_count}\n\n"
-        f"👥 Рефералов: {referrals}\n"
-        f"</blockquote>"
-    )
-    
+
+    profile = db.get_user_profile(callback.from_user.id)
+    admin_tag = " 👑 АДМИН" if is_admin(callback.from_user.id) else ""
+    text = build_questionnaire_text(user, profile, admin_tag)
+
+    show_bday = profile[5] if profile and profile[5] is not None else 1
+    bday_btn = "🙈 Скрыть ДР" if show_bday else "👁 Показать ДР"
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад в профиль", callback_data="profile")]
+        [InlineKeyboardButton(text="✏️ Никнейм", callback_data="q_edit_nick")],
+        [InlineKeyboardButton(text="🏙 Город", callback_data="q_edit_city"),
+         InlineKeyboardButton(text="🗓 Дата рожд.", callback_data="q_edit_birthday")],
+        [InlineKeyboardButton(text="⚧️ Пол", callback_data="q_edit_gender"),
+         InlineKeyboardButton(text=bday_btn, callback_data="q_toggle_birthday")],
+        [InlineKeyboardButton(text="📝 О себе", callback_data="q_edit_about")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile_settings")]
     ])
-    
+
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+# ── Редактирование анкеты: каждое поле ──────────────────────────────
+
+@dp.callback_query(F.data == "q_toggle_birthday")
+async def q_toggle_birthday(callback: CallbackQuery):
+    await callback.answer()
+    profile = db.get_user_profile(callback.from_user.id)
+    current = profile[5] if profile and profile[5] is not None else 1
+    db.update_user_profile(callback.from_user.id, 'show_birthday', 0 if current else 1)
+    await callback_profile_questionnaire(callback)
+
+
+@dp.callback_query(F.data == "q_edit_nick")
+async def q_edit_nick(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(UserStates.waiting_for_nickname)
+    await state.update_data(from_questionnaire=True)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_questionnaire")]
+    ])
+    await callback.message.edit_text(
+        "✏️ <b>Введи новый никнейм:</b>\n\n"
+        "<blockquote>От 2 до 20 символов. Без спецсимволов.</blockquote>",
+        reply_markup=keyboard, parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "q_edit_city")
+async def q_edit_city(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(UserStates.profile_city)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_questionnaire")]
+    ])
+    await callback.message.edit_text(
+        "🏙 <b>Введи свой город:</b>\n\n"
+        "<blockquote>Например: Москва, Минск, Алматы</blockquote>",
+        reply_markup=keyboard, parse_mode="HTML"
+    )
+
+@dp.message(UserStates.profile_city, F.text[0] != "/")
+async def process_profile_city(message: Message, state: FSMContext):
+    city = message.text.strip()
+    if len(city) > 50:
+        await message.answer("❌ Слишком длинно! Макс. 50 символов.")
+        return
+    db.update_user_profile(message.from_user.id, 'city', city)
+    await state.clear()
+    user = db.get_user(message.from_user.id)
+    profile = db.get_user_profile(message.from_user.id)
+    admin_tag = " 👑 АДМИН" if is_admin(message.from_user.id) else ""
+    text = build_questionnaire_text(user, profile, admin_tag)
+    show_bday = profile[5] if profile and profile[5] is not None else 1
+    bday_btn = "🙈 Скрыть ДР" if show_bday else "👁 Показать ДР"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Никнейм", callback_data="q_edit_nick")],
+        [InlineKeyboardButton(text="🏙 Город", callback_data="q_edit_city"),
+         InlineKeyboardButton(text="🗓 Дата рожд.", callback_data="q_edit_birthday")],
+        [InlineKeyboardButton(text="⚧️ Пол", callback_data="q_edit_gender"),
+         InlineKeyboardButton(text=bday_btn, callback_data="q_toggle_birthday")],
+        [InlineKeyboardButton(text="📝 О себе", callback_data="q_edit_about")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile_settings")]
+    ])
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "q_edit_birthday")
+async def q_edit_birthday(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(UserStates.profile_birthday)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_questionnaire")]
+    ])
+    await callback.message.edit_text(
+        "🗓 <b>Введи дату рождения:</b>\n\n"
+        "<blockquote>Формат: ДД.ММ  (например: 18.07)\n"
+        "Или: ДД.ММ.ГГГГ  (например: 18.07.2000)</blockquote>",
+        reply_markup=keyboard, parse_mode="HTML"
+    )
+
+@dp.message(UserStates.profile_birthday, F.text[0] != "/")
+async def process_profile_birthday(message: Message, state: FSMContext):
+    import re
+    text_in = message.text.strip()
+    if not re.match(r'^\d{2}\.\d{2}(\.\d{4})?$', text_in):
+        await message.answer("❌ Неверный формат! Введи ДД.ММ или ДД.ММ.ГГГГ")
+        return
+    db.update_user_profile(message.from_user.id, 'birthday', text_in)
+    await state.clear()
+    user = db.get_user(message.from_user.id)
+    profile = db.get_user_profile(message.from_user.id)
+    admin_tag = " 👑 АДМИН" if is_admin(message.from_user.id) else ""
+    text = build_questionnaire_text(user, profile, admin_tag)
+    show_bday = profile[5] if profile and profile[5] is not None else 1
+    bday_btn = "🙈 Скрыть ДР" if show_bday else "👁 Показать ДР"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Никнейм", callback_data="q_edit_nick")],
+        [InlineKeyboardButton(text="🏙 Город", callback_data="q_edit_city"),
+         InlineKeyboardButton(text="🗓 Дата рожд.", callback_data="q_edit_birthday")],
+        [InlineKeyboardButton(text="⚧️ Пол", callback_data="q_edit_gender"),
+         InlineKeyboardButton(text=bday_btn, callback_data="q_toggle_birthday")],
+        [InlineKeyboardButton(text="📝 О себе", callback_data="q_edit_about")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile_settings")]
+    ])
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "q_edit_gender")
+async def q_edit_gender(callback: CallbackQuery):
+    await callback.answer()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♂️ Мужской", callback_data="q_gender_male"),
+         InlineKeyboardButton(text="♀️ Женский", callback_data="q_gender_female")],
+        [InlineKeyboardButton(text="⚧️ Другой", callback_data="q_gender_other"),
+         InlineKeyboardButton(text="❌ Не указывать", callback_data="q_gender_none")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile_questionnaire")]
+    ])
+    await callback.message.edit_text(
+        "⚧️ <b>Выбери пол:</b>", reply_markup=keyboard, parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("q_gender_"))
+async def q_set_gender(callback: CallbackQuery):
+    await callback.answer()
+    val = callback.data.replace("q_gender_", "")
+    if val == "none":
+        db.update_user_profile(callback.from_user.id, 'gender', None)
+    else:
+        db.update_user_profile(callback.from_user.id, 'gender', val)
+    await callback_profile_questionnaire(callback)
+
+
+@dp.callback_query(F.data == "q_edit_about")
+async def q_edit_about(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(UserStates.profile_about)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile_questionnaire")]
+    ])
+    await callback.message.edit_text(
+        "📝 <b>Расскажи о себе:</b>\n\n"
+        "<blockquote>Макс. 200 символов. Это будет видно другим игрокам в твоей анкете.</blockquote>",
+        reply_markup=keyboard, parse_mode="HTML"
+    )
+
+@dp.message(UserStates.profile_about, F.text[0] != "/")
+async def process_profile_about(message: Message, state: FSMContext):
+    about = message.text.strip()
+    if len(about) > 200:
+        await message.answer(f"❌ Слишком длинно! Макс. 200 символов (у тебя {len(about)}).")
+        return
+    db.update_user_profile(message.from_user.id, 'about', about)
+    await state.clear()
+    user = db.get_user(message.from_user.id)
+    profile = db.get_user_profile(message.from_user.id)
+    admin_tag = " 👑 АДМИН" if is_admin(message.from_user.id) else ""
+    text = build_questionnaire_text(user, profile, admin_tag)
+    show_bday = profile[5] if profile and profile[5] is not None else 1
+    bday_btn = "🙈 Скрыть ДР" if show_bday else "👁 Показать ДР"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Никнейм", callback_data="q_edit_nick")],
+        [InlineKeyboardButton(text="🏙 Город", callback_data="q_edit_city"),
+         InlineKeyboardButton(text="🗓 Дата рожд.", callback_data="q_edit_birthday")],
+        [InlineKeyboardButton(text="⚧️ Пол", callback_data="q_edit_gender"),
+         InlineKeyboardButton(text=bday_btn, callback_data="q_toggle_birthday")],
+        [InlineKeyboardButton(text="📝 О себе", callback_data="q_edit_about")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="profile_settings")]
+    ])
+    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 
@@ -5637,7 +6622,7 @@ async def callback_transfer_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-@dp.message(UserStates.waiting_for_transfer_target)
+@dp.message(UserStates.waiting_for_transfer_target, F.text[0] != "/")
 async def process_transfer_target(message: Message, state: FSMContext):
     """Получаем MID получателя"""
     text = message.text.strip()
@@ -5690,7 +6675,7 @@ async def process_transfer_target(message: Message, state: FSMContext):
     )
 
 
-@dp.message(UserStates.waiting_for_transfer_amount)
+@dp.message(UserStates.waiting_for_transfer_amount, F.text[0] != "/")
 async def process_transfer_amount(message: Message, state: FSMContext):
     """Получаем сумму и совершаем перевод"""
     text = message.text.strip()
@@ -5891,7 +6876,7 @@ async def process_profile_photo(message: Message, state: FSMContext):
     )
 
 
-@dp.message(UserStates.waiting_for_profile_photo)
+@dp.message(UserStates.waiting_for_profile_photo, F.text[0] != "/")
 async def process_profile_photo_wrong(message: Message, state: FSMContext):
     """Если прислали не фото"""
     await message.answer(
@@ -6410,7 +7395,7 @@ async def callback_check_skip_username(callback: CallbackQuery, state: FSMContex
     await _ask_check_amount(callback.message, edit=True)
 
 
-@dp.message(UserStates.check_username)
+@dp.message(UserStates.check_username, F.text[0] != "/")
 async def process_check_username(message: Message, state: FSMContext):
     username = message.text.strip().lstrip('@')
     await state.update_data(check_username=username)
@@ -6435,7 +7420,7 @@ async def _ask_check_amount(msg, edit=False):
         await msg.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-@dp.message(UserStates.check_amount)
+@dp.message(UserStates.check_amount, F.text[0] != "/")
 async def process_check_amount(message: Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) <= 0:
         await message.answer("❌ Введи корректную сумму (целое положительное число).")
@@ -6467,7 +7452,7 @@ async def callback_check_activations_preset(callback: CallbackQuery, state: FSMC
     await _ask_check_comment(callback.message, edit=True)
 
 
-@dp.message(UserStates.check_activations)
+@dp.message(UserStates.check_activations, F.text[0] != "/")
 async def process_check_activations(message: Message, state: FSMContext):
     if not message.text.isdigit() or int(message.text) < 1:
         await message.answer("❌ Введи корректное число (минимум 1).")
@@ -6499,7 +7484,7 @@ async def callback_check_skip_comment(callback: CallbackQuery, state: FSMContext
     await _finalize_check(callback, state, callback.from_user.id)
 
 
-@dp.message(UserStates.check_comment)
+@dp.message(UserStates.check_comment, F.text[0] != "/")
 async def process_check_comment(message: Message, state: FSMContext):
     await state.update_data(check_comment=message.text.strip()[:100])
     await _finalize_check(message, state, message.from_user.id)
@@ -6659,7 +7644,7 @@ async def callback_activate_check_start(callback: CallbackQuery, state: FSMConte
     await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
 
-@dp.message(UserStates.activate_check_code)
+@dp.message(UserStates.activate_check_code, F.text[0] != "/")
 async def process_activate_check_code(message: Message, state: FSMContext):
     """Активируем чек по коду"""
     await state.clear()
@@ -7615,6 +8600,814 @@ async def cmd_fixhash(message: Message):
         parse_mode="HTML"
     )
 
+# ==================== КРАФТ ВИДЕОКАРТ ====================
+
+# Рецепты крафта: {result_key: {name, hash_rate, wear_mult, recipe: {компонент: кол-во}, description}}
+CRAFT_RECIPES = {
+    "craft_gtx_boost": {
+        "name": "⚡ GTX Boost Edition",
+        "base_gpu": "gtx_1080_ti",
+        "hash_rate": 55,
+        "wear_multiplier": 0.6,
+        "recipe": {
+            "🧩 Чип": 3,
+            "🔌 Кабель": 2,
+            "⚙️ Вентилятор": 2,
+        },
+        "description": "Разогнанный GTX 1080 Ti с усиленным охлаждением"
+    },
+    "craft_rtx_prime": {
+        "name": "🔥 RTX Prime Edition",
+        "base_gpu": "rtx_3070",
+        "hash_rate": 80,
+        "wear_multiplier": 0.5,
+        "recipe": {
+            "🧩 Чип": 5,
+            "💾 Микросхема": 3,
+            "⚙️ Вентилятор": 3,
+            "🔌 Кабель": 2,
+        },
+        "description": "RTX 3070 с кастомной прошивкой и улучшенной памятью"
+    },
+    "craft_rx_turbo": {
+        "name": "🔴 RX Turbo Edition",
+        "base_gpu": "rx_6800_xt",
+        "hash_rate": 100,
+        "wear_multiplier": 0.5,
+        "recipe": {
+            "🧩 Чип": 6,
+            "🛡️ Радиатор": 4,
+            "🔌 Кабель": 3,
+            "⚙️ Вентилятор": 3,
+        },
+        "description": "RX 6800 XT с AMD-оптимизацией под майнинг"
+    },
+    "craft_rtx_ultra": {
+        "name": "💎 RTX Ultra Edition",
+        "base_gpu": "rtx_3080_ti",
+        "hash_rate": 115,
+        "wear_multiplier": 0.45,
+        "recipe": {
+            "🧩 Чип": 8,
+            "💾 Микросхема": 5,
+            "🛡️ Радиатор": 4,
+            "⚙️ Вентилятор": 4,
+            "🔌 Кабель": 3,
+        },
+        "description": "RTX 3080 Ti с жидкостным охлаждением и оверклоком"
+    },
+    "craft_rtx_god": {
+        "name": "🌟 RTX God Edition",
+        "base_gpu": "rtx_3090",
+        "hash_rate": 140,
+        "wear_multiplier": 0.35,
+        "recipe": {
+            "🧩 Чип": 12,
+            "💾 Микросхема": 8,
+            "🛡️ Радиатор": 6,
+            "⚙️ Вентилятор": 6,
+            "🔌 Кабель": 5,
+        },
+        "description": "Легендарная RTX 3090 с полным разгоном — элита майнинга"
+    },
+}
+
+
+def get_craft_menu_keyboard():
+    buttons = []
+    for key, recipe in CRAFT_RECIPES.items():
+        buttons.append([InlineKeyboardButton(
+            text=f"{recipe['name']} — {recipe['hash_rate']} HM/s",
+            callback_data=f"craft_view:{key}"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("craft"))
+async def cmd_craft(message: Message, state: FSMContext):
+    """Меню крафта видеокарт"""
+    await state.clear()
+    if await check_ban(message.from_user.id):
+        await send_ban_message(message)
+        return
+    await state.clear()
+
+    components = {c[0]: c[1] for c in db.get_user_components(message.from_user.id)}
+
+    text = (
+        "⚒️ <b>Крафт видеокарт</b>\n\n"
+        "<blockquote>"
+        "Крафтовые видеокарты мощнее магазинных и изнашиваются медленнее.\n\n"
+        "Компоненты выпадают из 📦 боксов при майнинге.\n\n"
+        "🧩 Чип — {}\n"
+        "⚙️ Вентилятор — {}\n"
+        "🔌 Кабель — {}\n"
+        "🛡️ Радиатор — {}\n"
+        "💾 Микросхема — {}"
+        "</blockquote>\n\n"
+        "Выбери рецепт:"
+    ).format(
+        components.get("🧩 Чип", 0),
+        components.get("⚙️ Вентилятор", 0),
+        components.get("🔌 Кабель", 0),
+        components.get("🛡️ Радиатор", 0),
+        components.get("💾 Микросхема", 0),
+    )
+
+    await message.answer(text, reply_markup=get_craft_menu_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "craft_menu")
+async def callback_craft_menu(callback: CallbackQuery):
+    await callback.answer()
+    components = {c[0]: c[1] for c in db.get_user_components(callback.from_user.id)}
+
+    text = (
+        "⚒️ <b>Крафт видеокарт</b>\n\n"
+        "<blockquote>"
+        "Твои компоненты:\n"
+        "🧩 Чип — {}\n"
+        "⚙️ Вентилятор — {}\n"
+        "🔌 Кабель — {}\n"
+        "🛡️ Радиатор — {}\n"
+        "💾 Микросхема — {}"
+        "</blockquote>\n\n"
+        "Выбери рецепт:"
+    ).format(
+        components.get("🧩 Чип", 0),
+        components.get("⚙️ Вентилятор", 0),
+        components.get("🔌 Кабель", 0),
+        components.get("🛡️ Радиатор", 0),
+        components.get("💾 Микросхема", 0),
+    )
+
+    await callback.message.edit_text(text, reply_markup=get_craft_menu_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("craft_view:"))
+async def callback_craft_view(callback: CallbackQuery):
+    await callback.answer()
+    key = callback.data.split(":", 1)[1]
+    recipe = CRAFT_RECIPES.get(key)
+    if not recipe:
+        await callback.answer("❌ Рецепт не найден", show_alert=True)
+        return
+
+    components = {c[0]: c[1] for c in db.get_user_components(callback.from_user.id)}
+
+    # Проверяем наличие компонентов
+    can_craft = True
+    recipe_lines = ""
+    for comp, need in recipe["recipe"].items():
+        have = components.get(comp, 0)
+        ok = "✅" if have >= need else "❌"
+        if have < need:
+            can_craft = False
+        recipe_lines += f"  {ok} {comp}: {have}/{need}\n"
+
+    wear_pct = int(recipe["wear_multiplier"] * 100)
+
+    text = (
+        f"⚒️ <b>{recipe['name']}</b>\n\n"
+        f"<blockquote>"
+        f"📖 {recipe['description']}\n\n"
+        f"⚡ Хешрейт: <b>{recipe['hash_rate']} HM/s</b>\n"
+        f"🛡 Износ: <b>{wear_pct}% от обычного</b>\n\n"
+        f"📦 Требуется компонентов:\n"
+        f"{recipe_lines}"
+        f"</blockquote>"
+    )
+
+    buttons = []
+    if can_craft:
+        buttons.append([InlineKeyboardButton(
+            text=f"⚒️ Скрафтить {recipe['name']}",
+            callback_data=f"craft_do:{key}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(
+            text="❌ Недостаточно компонентов",
+            callback_data="craft_no_comp"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ К рецептам", callback_data="craft_menu")])
+
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "craft_no_comp")
+async def callback_craft_no_comp(callback: CallbackQuery):
+    await callback.answer("📦 Открывай боксы чтобы получить компоненты!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("craft_do:"))
+async def callback_craft_do(callback: CallbackQuery):
+    await callback.answer()
+    key = callback.data.split(":", 1)[1]
+    recipe = CRAFT_RECIPES.get(key)
+    if not recipe:
+        await callback.answer("❌ Рецепт не найден", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    components = {c[0]: c[1] for c in db.get_user_components(user_id)}
+
+    # Финальная проверка компонентов
+    for comp, need in recipe["recipe"].items():
+        if components.get(comp, 0) < need:
+            await callback.answer(f"❌ Не хватает: {comp}", show_alert=True)
+            return
+
+    # Списываем компоненты
+    c = db.conn.cursor()
+    for comp, need in recipe["recipe"].items():
+        c.execute(
+            "UPDATE components SET amount = amount - ? WHERE user_id = ? AND component_name = ?",
+            (need, user_id, comp)
+        )
+        c.execute(
+            "DELETE FROM components WHERE user_id = ? AND component_name = ? AND amount <= 0",
+            (user_id, comp)
+        )
+
+    # Создаём крафтовую GPU
+    c.execute(
+        """INSERT INTO user_gpus
+           (user_id, gpu_key, name, hash_rate, wear, is_crafted, wear_multiplier)
+           VALUES (?, ?, ?, ?, 100, 1, ?)""",
+        (user_id, key, recipe["name"], recipe["hash_rate"], recipe["wear_multiplier"])
+    )
+    db.conn.commit()
+
+    # Пересчитываем хешрейт
+    db.recalculate_user_hashrate(user_id)
+
+    wear_pct = int(recipe["wear_multiplier"] * 100)
+    recipe_used = "\n".join(f"  • {c}: {n}" for c, n in recipe["recipe"].items())
+
+    text = (
+        f"✅ <b>Крафт успешен!</b>\n\n"
+        f"<blockquote>"
+        f"🎉 Создана: <b>{recipe['name']}</b>\n\n"
+        f"⚡ Хешрейт: <b>{recipe['hash_rate']} HM/s</b>\n"
+        f"🛡 Износ: <b>{wear_pct}% от обычного</b>\n\n"
+        f"Потрачено:\n{recipe_used}"
+        f"</blockquote>\n\n"
+        f"💡 Установи карту в риг через /rigs"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text="⚒️ Крафтить ещё", callback_data="craft_menu")],
+        [InlineKeyboardButton(text="💿 Мои риги", callback_data="my_rigs")]
+    ]
+
+    await callback.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML"
+    )
+
+# ==================== БАРАХОЛКА ====================
+
+async def market_expire_scheduler():
+    """Каждый час возвращает просроченные лоты продавцам"""
+    while True:
+        try:
+            expired = db.market_expire_listings()
+            if expired:
+                logger.info(f"Market: вернули {expired} просроченных лотов")
+        except Exception as e:
+            logger.error(f"market_expire_scheduler error: {e}")
+        await asyncio.sleep(3600)
+
+
+def market_sort_keyboard(current_sort, item_type_filter, page):
+    """Кнопки сортировки"""
+    sorts = [
+        ("💰 Дешевле", "price_asc"),
+        ("💎 Дороже", "price_desc"),
+        ("⚡ Хешрейт", "hash_desc"),
+        ("🛡 Износ", "wear_desc"),
+        ("🆕 Новые", "new"),
+    ]
+    filter_labels = {"all": "Все", "gpu": "GPU", "cooler": "Куллеры"}
+    type_cycle = {"all": "gpu", "gpu": "cooler", "cooler": "all"}
+
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if s[1] == current_sort else ''}{s[0]}",
+            callback_data=f"mkt_sort:{s[1]}:{item_type_filter}:{page}"
+        ) for s in sorts[:3]],
+        [InlineKeyboardButton(
+            text=f"{'✅ ' if s[1] == current_sort else ''}{s[0]}",
+            callback_data=f"mkt_sort:{s[1]}:{item_type_filter}:{page}"
+        ) for s in sorts[3:]],
+        [InlineKeyboardButton(
+            text=f"🔍 Тип: {filter_labels.get(item_type_filter, 'Все')}",
+            callback_data=f"mkt_sort:{current_sort}:{type_cycle.get(item_type_filter, 'all')}:{page}"
+        )],
+    ]
+    return buttons
+
+
+def build_market_text_and_keyboard(user_id, sort, item_filter, page):
+    PAGE_SIZE = 9
+    type_arg = None if item_filter == 'all' else item_filter
+    listings = db.market_get_listings(
+        item_type=type_arg, sort=sort,
+        exclude_user=user_id, limit=PAGE_SIZE, offset=page * PAGE_SIZE
+    )
+    total_list = db.market_get_listings(item_type=type_arg, sort=sort, exclude_user=user_id, limit=9999, offset=0)
+    total_count = len(total_list)
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    filter_labels = {"all": "Все товары", "gpu": "Видеокарты", "cooler": "Куллеры", "component": "Компоненты"}
+    sort_labels = {
+        "price_asc": "Сначала дешевле", "price_desc": "Сначала дороже",
+        "hash_desc": "По хешрейту", "wear_desc": "По износу", "new": "Новые"
+    }
+
+    text = (
+        f"🏪 <b>Барахолка</b> — {filter_labels.get(item_filter, 'Все')}\n"
+        f"<i>Сортировка: {sort_labels.get(sort, sort)}</i>  |  "
+        f"<i>стр. {page+1}/{total_pages}  ({total_count} лотов)</i>\n\n"
+    )
+
+    buttons = market_sort_keyboard(sort, item_filter, page)
+    item_buttons = []
+
+    if not listings:
+        text += "😔 Товаров нет. Выставь своё оборудование!"
+    else:
+        for lst in listings:
+            lid, seller_id, itype, iid, iname, hr, cp, wear, price, is_crafted, listed_at, expires_at, is_active = lst
+            craft_tag = " ⚒️" if is_crafted else ""
+            if itype == 'gpu':
+                desc = f"⚡{hr:.0f} HM/s | 🛡{wear}%{craft_tag}"
+            elif itype == 'cooler':
+                desc = f"❄️{cp} | 🛡{wear}%"
+            else:
+                desc = "🔩 Компонент"
+            short_name = iname[:18] + ("…" if len(iname) > 18 else "")
+            item_buttons.append([InlineKeyboardButton(
+                text=f"🛒 {short_name} — {price}т",
+                callback_data=f"mkt_buy_view:{lid}"
+            )])
+
+    # Раскладываем кнопки товаров по 3 в ряд
+    rows_3 = []
+    row = []
+    for btn_list in item_buttons:
+        btn = btn_list[0]
+        row.append(btn)
+        if len(row) == 3:
+            rows_3.append(row)
+            row = []
+    if row:
+        rows_3.append(row)
+    buttons += rows_3
+
+    # Навигация ◀️ [1/N] ▶️
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"mkt_sort:{sort}:{item_filter}:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if (page + 1) * PAGE_SIZE < total_count:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"mkt_sort:{sort}:{item_filter}:{page+1}"))
+    buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="📦 Мои лоты", callback_data="mkt_my_listings")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")])
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(Command("market"))
+async def cmd_market(message: Message, state: FSMContext):
+    await state.clear()
+    if await check_ban(message.from_user.id):
+        await send_ban_message(message)
+        return
+    await state.clear()
+    text, kb = build_market_text_and_keyboard(message.from_user.id, "price_asc", "all", 0)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "market")
+async def callback_market(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    text, kb = build_market_text_and_keyboard(callback.from_user.id, "price_asc", "all", 0)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "noop")
+async def callback_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mkt_sort:"))
+async def callback_mkt_sort(callback: CallbackQuery):
+    await callback.answer()
+    _, sort, item_filter, page_str = callback.data.split(":")
+    text, kb = build_market_text_and_keyboard(callback.from_user.id, sort, item_filter, int(page_str))
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("mkt_buy_view:"))
+async def callback_mkt_buy_view(callback: CallbackQuery):
+    await callback.answer()
+    listing_id = int(callback.data.split(":")[1])
+    c = db.conn.cursor()
+    c.execute("SELECT * FROM market_listings WHERE id = ? AND is_active = 1", (listing_id,))
+    lst = c.fetchone()
+    if not lst:
+        await callback.answer("❌ Лот уже не доступен", show_alert=True)
+        return
+
+    lid, seller_id, itype, iid, iname, hr, cp, wear, price, is_crafted, listed_at, expires_at, is_active = lst
+    seller = db.get_user(seller_id)
+    seller_name = seller[3] if seller else "Неизвестно"
+    craft_tag = " ⚒️ Крафт" if is_crafted else ""
+    expires_dt = datetime.fromisoformat(expires_at)
+    days_left = max(0, (expires_dt - datetime.now()).days)
+
+    if itype == 'gpu':
+        stats = f"⚡ Хешрейт: {hr:.0f} HM/s\n🛡 Состояние: {wear}%{craft_tag}"
+    elif itype == 'cooler':
+        stats = f"❄️ Мощность охлаждения: {cp}\n🛡 Состояние: {wear}%"
+    else:
+        stats = "🔩 Компонент"
+
+    user = db.get_user(callback.from_user.id)
+    balance = int(user[4]) if user else 0
+    can_buy = balance >= price and seller_id != callback.from_user.id
+
+    text = (
+        f"🛒 <b>{iname}</b>{craft_tag}\n\n"
+        f"<blockquote>"
+        f"{stats}\n\n"
+        f"💰 Цена: <b>{price} тон</b>\n"
+        f"👤 Продавец: {escape_html(seller_name)}\n"
+        f"⏰ Истекает через: {days_left} дн."
+        f"</blockquote>\n\n"
+        f"Твой баланс: {balance} тон"
+    )
+
+    buttons = []
+    if seller_id == callback.from_user.id:
+        buttons.append([InlineKeyboardButton(text="❌ Это твой лот", callback_data="mkt_my_listings")])
+    elif can_buy:
+        buttons.append([InlineKeyboardButton(
+            text=f"✅ Купить за {price} тон",
+            callback_data=f"mkt_buy_confirm:{listing_id}"
+        )])
+    else:
+        buttons.append([InlineKeyboardButton(text="❌ Недостаточно тон", callback_data="mkt_no_funds")])
+
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="market")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "mkt_no_funds")
+async def callback_mkt_no_funds(callback: CallbackQuery):
+    await callback.answer("❌ Недостаточно тон для покупки!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("mkt_buy_confirm:"))
+async def callback_mkt_buy_confirm(callback: CallbackQuery):
+    listing_id = int(callback.data.split(":")[1])
+    success, result = db.market_buy_item(callback.from_user.id, listing_id)
+
+    if success:
+        await callback.answer("✅ Куплено!", show_alert=True)
+        try:
+            await bot.send_message(
+                result["seller_id"],
+                f"💰 <b>Твой товар куплен!</b>\n\n"
+                f"📦 {result['item_name']}\n"
+                f"💵 +{result['price']} тон на счёт",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        text, kb = build_market_text_and_keyboard(callback.from_user.id, "price_asc", "all", 0)
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await callback.answer(result, show_alert=True)
+
+
+@dp.callback_query(F.data == "mkt_my_listings")
+async def callback_mkt_my_listings(callback: CallbackQuery):
+    await callback.answer()
+    listings = db.market_get_listings(only_user=callback.from_user.id, limit=20, offset=0)
+
+    text = "📦 <b>Мои лоты на барахолке</b>\n\n"
+    buttons = []
+
+    if not listings:
+        text += "У тебя нет активных лотов.\n\nВыставь видеокарту или куллер со склада!"
+    else:
+        for lst in listings:
+            lid, seller_id, itype, iid, iname, hr, cp, wear, price, is_crafted, listed_at, expires_at, is_active = lst
+            craft_tag = " ⚒️" if is_crafted else ""
+            expires_dt = datetime.fromisoformat(expires_at)
+            days_left = max(0, (expires_dt - datetime.now()).days)
+            if itype == 'gpu':
+                desc = f"⚡{hr:.0f} HM/s | 🛡{wear}%"
+            elif itype == 'cooler':
+                desc = f"❄️{cp} | 🛡{wear}%"
+            else:
+                desc = f"🔩 {item_id} шт."
+            text += f"• <b>{iname}</b>{craft_tag} — {price} тон | {desc} | ⏰{days_left}д\n"
+            buttons.append([InlineKeyboardButton(
+                text=f"❌ Снять: {iname}",
+                callback_data=f"mkt_cancel:{lid}"
+            )])
+
+    buttons.append([InlineKeyboardButton(text="➕ Выставить товар", callback_data="mkt_sell_choose")])
+    buttons.append([InlineKeyboardButton(text="◀️ Барахолка", callback_data="market")])
+    await callback.message.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("mkt_cancel:"))
+async def callback_mkt_cancel(callback: CallbackQuery):
+    await callback.answer()
+    listing_id = int(callback.data.split(":")[1])
+    success, msg = db.market_cancel_listing(listing_id, callback.from_user.id)
+    await callback.answer(msg, show_alert=True)
+    await callback_mkt_my_listings(callback)
+
+
+# ── Выставление на продажу из инвентаря ─────────────────────────
+
+class MarketStates(StatesGroup):
+    waiting_price = State()
+
+
+@dp.callback_query(F.data == "mkt_sell_choose")
+async def callback_mkt_sell_choose(callback: CallbackQuery):
+    """Показываем выбор категории: GPU / Куллер"""
+    await callback.answer()
+    buttons = [
+        [InlineKeyboardButton(text="🖼 Видеокарты (GPU)", callback_data="mkt_inv_gpu")],
+        [InlineKeyboardButton(text="💨 Куллеры",          callback_data="mkt_inv_cooler")],
+        [InlineKeyboardButton(text="◀️ Назад",             callback_data="mkt_my_listings")],
+    ]
+    await callback.message.edit_text(
+        "🏪 <b>Выставить товар</b>\n\nВыбери категорию:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "mkt_inv_gpu")
+async def callback_mkt_inv_gpu(callback: CallbackQuery):
+    """Список свободных GPU для продажи"""
+    await callback.answer()
+    c = db.conn.cursor()
+    # Только не установленные и не на барахолке
+    c.execute("""
+        SELECT g.id, g.name, g.hash_rate, g.wear, g.is_crafted
+        FROM user_gpus g
+        WHERE g.user_id = ? AND (g.is_installed = 0 OR g.is_installed IS NULL)
+          AND g.id NOT IN (
+              SELECT item_id FROM market_listings
+              WHERE seller_id = ? AND item_type = 'gpu' AND is_active = 1
+          )
+        ORDER BY g.hash_rate DESC
+    """, (callback.from_user.id, callback.from_user.id))
+    rows = c.fetchall()
+
+    if not rows:
+        await callback.answer("❌ Нет свободных видеокарт для продажи", show_alert=True)
+        return
+
+    buttons = []
+    for gid, name, hr, wear, is_crafted in rows:
+        craft = " ⚒️" if is_crafted else ""
+        buttons.append([InlineKeyboardButton(
+            text=f"🖼 {name}{craft} | {hr:.0f} HM/s | {wear}%",
+            callback_data=f"mkt_sell_gpu:{gid}"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_sell_choose")])
+
+    await callback.message.edit_text(
+        "🖼 <b>Выбери видеокарту для продажи:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "mkt_inv_cooler")
+async def callback_mkt_inv_cooler(callback: CallbackQuery):
+    """Список свободных куллеров для продажи"""
+    await callback.answer()
+    c = db.conn.cursor()
+    c.execute("""
+        SELECT cl.id, cl.name, cl.cooling_power, cl.wear
+        FROM user_coolers cl
+        WHERE cl.user_id = ? AND cl.rig_id IS NULL
+          AND cl.id NOT IN (
+              SELECT item_id FROM market_listings
+              WHERE seller_id = ? AND item_type = 'cooler' AND is_active = 1
+          )
+        ORDER BY cl.cooling_power DESC
+    """, (callback.from_user.id, callback.from_user.id))
+    rows = c.fetchall()
+
+    if not rows:
+        await callback.answer("❌ Нет свободных куллеров для продажи", show_alert=True)
+        return
+
+    buttons = []
+    for cid, name, cp, wear in rows:
+        buttons.append([InlineKeyboardButton(
+            text=f"💨 {name} | ❄️{cp} | {wear}%",
+            callback_data=f"mkt_sell_cooler:{cid}"
+        )])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="mkt_sell_choose")])
+
+    await callback.message.edit_text(
+        "💨 <b>Выбери куллер для продажи:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data.startswith("mkt_sell_gpu:"))
+async def callback_mkt_sell_gpu(callback: CallbackQuery, state: FSMContext):
+    """Нажали 'Продать на барахолке' для GPU"""
+    await callback.answer()
+    gpu_id = int(callback.data.split(":")[1])
+    gpu = db.conn.cursor()
+    gpu.execute("SELECT name, hash_rate, wear, gpu_key FROM user_gpus WHERE id = ? AND user_id = ? AND is_installed = 0", (gpu_id, callback.from_user.id))
+    row = gpu.fetchone()
+    if not row:
+        await callback.answer("❌ Видеокарта недоступна (установлена или не твоя)", show_alert=True)
+        return
+
+    name, hr, wear, gpu_key = row
+    shop_price = db.market_get_shop_price('gpu', gpu_key=gpu_key)
+    min_price = max(1, int(shop_price * 0.1)) if shop_price else 1
+
+    await state.set_state(MarketStates.waiting_price)
+    await state.update_data(item_type='gpu', item_id=gpu_id, item_name=name, shop_price=shop_price)
+
+    quick_price = int(shop_price * 0.3) if shop_price else 0
+    text = (
+        f"💰 <b>Продажа: {escape_html(name)}</b>\n\n"
+        f"<blockquote>"
+        f"⚡ {hr:.0f} HM/s | 🛡 {wear}%\n"
+        f"💵 Цена в магазине: {shop_price} тон\n"
+        f"⚡ Быстрая продажа: {quick_price} тон (30%)"
+        f"</blockquote>\n\n"
+        f"Введи свою цену (тон):"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="my_gpus")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("mkt_sell_cooler:"))
+async def callback_mkt_sell_cooler(callback: CallbackQuery, state: FSMContext):
+    """Нажали 'Продать на барахолке' для куллера"""
+    await callback.answer()
+    cooler_id = int(callback.data.split(":")[1])
+    c = db.conn.cursor()
+    c.execute("SELECT name, cooling_power, wear, cooler_key FROM user_coolers WHERE id = ? AND user_id = ? AND rig_id IS NULL", (cooler_id, callback.from_user.id))
+    row = c.fetchone()
+    if not row:
+        await callback.answer("❌ Куллер недоступен", show_alert=True)
+        return
+
+    name, cp, wear, cooler_key = row
+    shop_price = db.market_get_shop_price('cooler', cooler_key=cooler_key)
+    quick_price = int(shop_price * 0.3) if shop_price else 0
+
+    await state.set_state(MarketStates.waiting_price)
+    await state.update_data(item_type='cooler', item_id=cooler_id, item_name=name, shop_price=shop_price)
+
+    text = (
+        f"💰 <b>Продажа: {escape_html(name)}</b>\n\n"
+        f"<blockquote>"
+        f"❄️ Мощность: {cp} | 🛡 {wear}%\n"
+        f"💵 Цена в магазине: {shop_price} тон\n"
+        f"⚡ Быстрая продажа: {quick_price} тон (30%)"
+        f"</blockquote>\n\n"
+        f"Введи свою цену (тон):"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="my_coolers")]
+    ])
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("mkt_sell_quick:"), MarketStates.waiting_price)
+async def callback_mkt_sell_quick(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    price = int(callback.data.split(":")[1])
+    await _do_list_item(callback, state, data, price)
+
+
+@dp.message(MarketStates.waiting_price, F.text[0] != "/")
+async def process_market_price(message: Message, state: FSMContext):
+    data = await state.get_data()
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("❌ Введи корректную цену (целое число > 0)")
+        return
+    price = int(message.text)
+    await _do_list_item(message, state, data, price)
+
+
+async def _do_list_item(msg_or_cb, state, data, price):
+    user_id = msg_or_cb.from_user.id
+    item_type = data.get('item_type')
+    item_id = data.get('item_id')
+    item_name = data.get('item_name', '')
+
+    success, result = db.market_list_item(user_id, item_type, item_id, price)
+    await state.clear()
+
+    text = (
+        f"✅ <b>Выставлено на барахолку!</b>\n\n"
+        f"<blockquote>"
+        f"📦 {escape_html(item_name)}\n"
+        f"💰 Цена: {price} тон\n"
+        f"⏰ Вернётся через 3 дня если не купят"
+        f"</blockquote>"
+    ) if success else f"❌ {result}"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏪 Барахолка", callback_data="market")],
+        [InlineKeyboardButton(text="📦 Мои лоты", callback_data="mkt_my_listings")]
+    ])
+
+    if isinstance(msg_or_cb, CallbackQuery):
+        await msg_or_cb.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    else:
+        await msg_or_cb.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("mkt_quick_sell_gpu:"))
+async def callback_mkt_quick_sell_gpu(callback: CallbackQuery):
+    """Быстрая продажа GPU за 30% без ввода цены"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    gpu_id, price = int(parts[1]), int(parts[2])
+
+    c = db.conn.cursor()
+    c.execute("SELECT name, hash_rate, wear FROM user_gpus WHERE id = ? AND user_id = ? AND is_installed = 0",
+              (gpu_id, callback.from_user.id))
+    row = c.fetchone()
+    if not row:
+        await callback.answer("❌ Видеокарта недоступна", show_alert=True)
+        return
+
+    success, result = db.market_list_item(callback.from_user.id, 'gpu', gpu_id, price)
+    if success:
+        await callback.answer(f"✅ Выставлено за {price} тон!", show_alert=True)
+        # Возвращаем в список карточек
+        gpus = db.get_user_gpus(callback.from_user.id, include_installed=True)
+        items = [('gpu', gpu) for gpu in gpus]
+        await callback.message.edit_text(
+            "🖼 <b>Твои видеокарты</b>\n\nВыбери видеокарту для просмотра:",
+            reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer(result, show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("mkt_quick_sell_cooler:"))
+async def callback_mkt_quick_sell_cooler(callback: CallbackQuery):
+    """Быстрая продажа куллера за 30% без ввода цены"""
+    await callback.answer()
+    parts = callback.data.split(":")
+    cooler_id, price = int(parts[1]), int(parts[2])
+
+    c = db.conn.cursor()
+    c.execute("SELECT name FROM user_coolers WHERE id = ? AND user_id = ? AND rig_id IS NULL",
+              (cooler_id, callback.from_user.id))
+    row = c.fetchone()
+    if not row:
+        await callback.answer("❌ Куллер недоступен", show_alert=True)
+        return
+
+    success, result = db.market_list_item(callback.from_user.id, 'cooler', cooler_id, price)
+    if success:
+        await callback.answer(f"✅ Выставлено за {price} тон!", show_alert=True)
+        free_coolers = db.get_free_coolers(callback.from_user.id)
+        items = [('cooler', c) for c in free_coolers]
+        await callback.message.edit_text(
+            "💨 <b>Твои куллеры</b>\n\nВыбери куллер для просмотра:",
+            reply_markup=get_mycards_keyboard(callback.from_user.id, items, 0),
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer(result, show_alert=True)
+
+
+
 # ==================== ЗАПУСК БОТА ====================
 async def main():
     print("🤖 Бот запущен!")
@@ -7628,6 +9421,7 @@ async def main():
     print("⚡ Нажми Ctrl+C для остановки")
     
     asyncio.create_task(auto_restock_scheduler())
+    asyncio.create_task(market_expire_scheduler())
     
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
@@ -7639,3 +9433,4 @@ if __name__ == "__main__":
         print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
+        
