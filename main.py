@@ -26,6 +26,10 @@ bot = Bot(token=config.BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+
+class WalletStates(StatesGroup):
+    waiting_stars_amount = State()
+
 # Функция для экранирования специальных символов HTML
 def escape_html(text):
     """Экранирует специальные символы для HTML"""
@@ -75,7 +79,8 @@ class Database:
                 boxes_count INTEGER DEFAULT 0,
                 privilege TEXT DEFAULT "player",
                 privilege_until TIMESTAMP DEFAULT NULL,
-                total_stars_spent INTEGER DEFAULT 0
+                total_stars_spent INTEGER DEFAULT 0,
+                stars_balance INTEGER DEFAULT 0
             )
         ''')
         
@@ -447,6 +452,12 @@ class Database:
                 self.cursor.execute(_idx)
             except Exception:
                 pass
+        # Миграция: промокоды на ник
+        self.cursor.execute(
+            "CREATE TABLE IF NOT EXISTS nick_promos "
+            "(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, "
+            "code TEXT UNIQUE, used INTEGER DEFAULT 0, used_at TIMESTAMP)"
+        )
         # Миграция: таблица заданий
         self.cursor.execute(
             'CREATE TABLE IF NOT EXISTS user_quests '
@@ -464,6 +475,12 @@ class Database:
                 self.conn.commit()
             except Exception:
                 pass  # колонка уже существует
+        # Миграция: баланс звёзд
+        try:
+            self.cursor.execute('ALTER TABLE users ADD COLUMN stars_balance INTEGER DEFAULT 0')
+            self.conn.commit()
+        except Exception:
+            pass
         # Восстанавливаем все сломанные асики (они больше не ломаются)
         try:
             self.cursor.execute('UPDATE user_asics SET is_working=1 WHERE is_working=0')
@@ -638,6 +655,14 @@ class Database:
         c.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
         result = c.fetchone()
         return list(result) if result else None
+
+    def get_stars(self, user_id: int) -> int:
+        """Читает stars_balance напрямую из БД по имени колонки."""
+        c = self.conn.cursor()
+        c.execute("SELECT stars_balance FROM users WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
 
     def get_user_by_custom_id(self, custom_id):
         self.cursor.execute('SELECT * FROM users WHERE custom_id = ?', (custom_id,))
@@ -1679,62 +1704,62 @@ class Database:
     def open_box(self, box_id):
         self.cursor.execute('SELECT user_id, box_type FROM boxes WHERE id = ? AND opened = 0', (box_id,))
         box = self.cursor.fetchone()
-        
         if not box:
             return None, "Коробка не найдена или уже открыта"
-        
         user_id, box_type = box
-        
-        rewards = []
-        
+
+        # Базовые награды
         ton_reward = random.randint(50, 200)
         exp_reward = random.randint(20, 100)
-        
-        self.cursor.execute('UPDATE users SET gems = gems + ?, exp = exp + ? WHERE user_id = ?', 
-                          (ton_reward, exp_reward, user_id))
-        
-        rewards.append(f"💰 {ton_reward} тон")
-        rewards.append(f"✨ {exp_reward} опыта")
-        
+        self.cursor.execute('UPDATE users SET gems=gems+?, exp=exp+? WHERE user_id=?',
+                            (ton_reward, exp_reward, user_id))
+
+        # Компоненты — суммируем одинаковые
+        comp_summary = {}
         if random.random() < 0.3:
-            components = ["🧩 Чип", "⚙️ Вентилятор", "🔌 Кабель", "🛡️ Радиатор", "💾 Микросхема"]
-            component = random.choice(components)
-            amount = random.randint(1, 3)
-            self.add_component(user_id, component, amount)
-            rewards.append(f"📦 {component} x{amount}")
-        
+            components = ["Чип", "Вентилятор", "Кабель", "Радиатор", "Микросхема"]
+            comp = random.choice(components)
+            amt = random.randint(1, 3)
+            self.add_component(user_id, "🧩 " + comp, amt)
+            comp_summary["🧩 " + comp] = comp_summary.get("🧩 " + comp, 0) + amt
+
+        # Куллер (5%)
+        cooler_drop = None
         if random.random() < 0.05:
-            cooler_keys = list(COOLERS.keys())
-            cooler_key = random.choice(cooler_keys)
-            cooler_data = COOLERS[cooler_key]
-            self.cursor.execute('''
-                INSERT INTO user_coolers 
-                (user_id, cooler_key, name, cooling_power, wear) 
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, cooler_key, cooler_data['name'], cooler_data['cooling_power'], 100))
-            rewards.append(f"💨 {cooler_data['name']}")
-        
+            cooler_key = random.choice(list(COOLERS.keys()))
+            cd = COOLERS[cooler_key]
+            self.cursor.execute(
+                "INSERT INTO user_coolers (user_id,cooler_key,name,cooling_power,wear) VALUES (?,?,?,?,?)",
+                (user_id, cooler_key, cd["name"], cd["cooling_power"], 100))
+            cooler_drop = cd["name"]
+
+        # Промокод на ник (1%) — вместо привилегии
+        promo_drop = None
         if random.random() < 0.01:
-            priv = random.choice(["premium", "vip"])
-            days = 7
-            self.apply_privilege(user_id, priv, days)
-            priv_name = config.PRIVILEGES[priv]['name']
-            priv_icon = config.PRIVILEGES[priv]['icon']
-            rewards.append(f"👑 {priv_icon} {priv_name} на {days} дней!")
-        
-        self.cursor.execute('''
-            UPDATE boxes SET opened = 1, opened_at = ? WHERE id = ?
-        ''', (datetime.now(), box_id))
-        
-        self.cursor.execute('UPDATE users SET boxes_count = boxes_count - 1 WHERE user_id = ?', (user_id,))
-        self.cursor.execute('UPDATE stats SET total_boxes_opened = total_boxes_opened + 1')
-        
+            import string
+            code = "NICK-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO nick_promos (user_id, code, used) VALUES (?,?,0)",
+                (user_id, code))
+            promo_drop = code
+
+        self.cursor.execute("UPDATE boxes SET opened=1, opened_at=? WHERE id=?",
+                            (datetime.now(), box_id))
+        self.cursor.execute("UPDATE users SET boxes_count=boxes_count-1 WHERE user_id=?", (user_id,))
+        self.cursor.execute("UPDATE stats SET total_boxes_opened=total_boxes_opened+1")
         self.conn.commit()
-        
-        reward_text = "🎁 <b>В коробке:</b>\n"
-        for reward in rewards:
-            reward_text += f"• {reward}\n"
-        
+
+        # Формируем текст — объединяем одинаковое
+        lines = []
+        lines.append(f"💰 {ton_reward} тон")
+        lines.append(f"✨ {exp_reward} опыта")
+        for comp, cnt in comp_summary.items():
+            lines.append(f"{comp} ×{cnt}" if cnt > 1 else comp)
+        if cooler_drop:
+            lines.append(f"💨 {cooler_drop}")
+        if promo_drop:
+            lines.append(f"🎟 Промокод на ник: <code>{promo_drop}</code>")
+        reward_text = "🎁 <b>В коробке:</b>\n" + "\n".join(f"• {l}" for l in lines)
         return True, reward_text
 
     def add_component(self, user_id, component_name, amount):
@@ -1924,10 +1949,51 @@ class Database:
 
     # ========== АДМИН МЕТОДЫ ==========
     
-    def add_gems(self, user_id, amount, admin_id):
+    def add_gems(self, user_id, amount, admin_id=None):
         self.cursor.execute('UPDATE users SET gems = gems + ? WHERE user_id = ?', (amount, user_id))
-        self.log_admin_action(admin_id, 'add_gems', user_id, f'+{amount} тон')
+        if admin_id:
+            self.log_admin_action(admin_id, 'add_gems', user_id, f'+{amount} тон')
         self.conn.commit()
+
+    def get_level_up_cost(self, current_level):
+        """Возвращает (ton_cost, exp_cost, error). error=None если всё ок."""
+        if current_level >= config.MAX_LEVEL:
+            return None, None, "Максимальный уровень"
+        # Кастомная стоимость
+        custom = config.CUSTOM_LEVEL_COSTS.get(current_level + 1)
+        if custom:
+            return custom["ton"], custom["exp"], None
+        # Базовая формула: base * multiplier^(level-1)
+        ton = int(config.LEVEL_UP_BASE_TON * (config.LEVEL_COST_MULTIPLIER ** (current_level - 1)))
+        exp = int(config.LEVEL_UP_BASE_EXP * (config.LEVEL_COST_MULTIPLIER ** (current_level - 1)))
+        return ton, exp, None
+
+    def level_up(self, user_id):
+        """Повысить уровень. Возвращает (True, data) или (False, msg)."""
+        user = self.get_user(user_id)
+        if not user:
+            return False, "Профиль не найден"
+        current_level = user[10]
+        current_exp   = user[11]
+        current_ton   = int(user[4])
+        ton_cost, exp_cost, error = self.get_level_up_cost(current_level)
+        if error:
+            return False, error
+        if current_ton < ton_cost:
+            return False, f"Недостаточно тон! Нужно {ton_cost}, у тебя {current_ton}"
+        if current_exp < exp_cost:
+            return False, f"Недостаточно опыта! Нужно {exp_cost}, у тебя {current_exp}"
+        new_level = current_level + 1
+        reward = config.LEVEL_REWARDS.get(new_level, {"ton": 0, "exp": 0, "bonus": "Нет награды"})
+        self.cursor.execute(
+            "UPDATE users SET level=?, gems=gems-?+?, exp=exp-?+? WHERE user_id=?",
+            (new_level, ton_cost, reward["ton"], exp_cost, reward["exp"], user_id)
+        )
+        self.conn.commit()
+        return True, {
+            "old_level": current_level, "new_level": new_level,
+            "ton_cost": ton_cost, "exp_cost": exp_cost, "reward": reward
+        }
 
     def remove_gems(self, user_id, amount, admin_id):
         self.cursor.execute('UPDATE users SET gems = gems - ? WHERE user_id = ?', (amount, user_id))
@@ -2580,19 +2646,30 @@ def _save_quests(user_id: int, data: dict):
     db.conn.commit()
 
 
-def advance_quest(user_id: int, quest_type: str, amount: int = 1):
-    """Продвинуть прогресс всех незавершённых заданий данного типа."""
+def advance_quest(user_id: int, quest_type: str, amount: int = 1) -> list:
+    """Продвинуть прогресс, авто-выдать награду при выполнении. Вернуть список выполненных."""
     data = get_user_quests(user_id)
     changed = False
+    completed = []
     for group in ("daily", "weekly"):
         for q in data.get(group, []):
             if q["type"] == quest_type and not q["done"]:
                 q["progress"] = min(q["progress"] + amount, q["target"])
                 if q["progress"] >= q["target"]:
                     q["done"] = True
+                    if not q.get("claimed"):
+                        q["claimed"] = True
+                        # Авто-выдаём награду
+                        db.add_gems(user_id, q["reward_ton"])
+                        db.cursor.execute(
+                            "UPDATE users SET exp=exp+? WHERE user_id=?",
+                            (q["reward_exp"], user_id))
+                        db.conn.commit()
+                        completed.append(q)
                 changed = True
     if changed:
         _save_quests(user_id, data)
+    return completed
 
 
 async def _show_quests(user_id: int, target, group: str = "daily"):
@@ -2627,14 +2704,8 @@ async def _show_quests(user_id: int, target, group: str = "daily"):
     text = "\n".join(lines)
 
 
-    # Кнопки получить награду
+    # Кнопки навигации (награды выдаются автоматически)
     buttons = []
-    for i, q in enumerate(quests):
-        if q["done"] and not q["claimed"]:
-            buttons.append([InlineKeyboardButton(
-                text=f"🎁 Получить: {q['desc'][:25]}",
-                callback_data=f"quest_claim:{group}:{i}"
-            )])
 
     nav = []
     if group == "daily":
@@ -2705,6 +2776,27 @@ async def cb_quest_claim(callback: CallbackQuery):
     await callback.answer(
         f"✅ Получено: +{q['reward_ton']} тон, +{q['reward_exp']} опыта!", show_alert=True)
     await _show_quests(callback.from_user.id, callback, group)
+
+
+@dp.message(Command("givestars"))
+async def cmd_givestars(message: Message):
+    """Только для админов: /givestars USER_ID AMOUNT"""
+    if not is_admin(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 3 or not args[1].isdigit() or not args[2].isdigit():
+        await message.answer("Использование: /givestars USER_ID AMOUNT")
+        return
+    uid, amount = int(args[1]), int(args[2])
+    db.cursor.execute(
+        "UPDATE users SET stars_balance=COALESCE(stars_balance,0)+? WHERE user_id=?",
+        (amount, uid)
+    )
+    db.conn.commit()
+    if db.cursor.rowcount:
+        await message.answer(f"✅ Выдано {amount} ★ пользователю {uid}")
+    else:
+        await message.answer("❌ Пользователь не найден")
 
 
 # ==================== ФУНКЦИИ ДЛЯ ИКОНОК ====================
@@ -2805,8 +2897,7 @@ def get_main_keyboard():
             InlineKeyboardButton(text="🌟 Уровень", callback_data="level"),
             InlineKeyboardButton(text="🪙 Донат", callback_data="donate_menu")
         ],
-        [InlineKeyboardButton(text="🏪 Барахолка", callback_data="market")],
-        [InlineKeyboardButton(text="➕ Добавить бота в группу", url=f"https://t.me/{config.BOT_USERNAME}?startgroup=true")]
+        [InlineKeyboardButton(text="➕ Добавить бота", url=f"https://t.me/{config.BOT_USERNAME}?startgroup=true")]
     ])
     return keyboard
 
@@ -2842,16 +2933,432 @@ def get_back_to_help_keyboard():
     ])
     return keyboard
 
+# Цены привилегий и наборов (звёзды)
+_PRIV_INFO = {
+    "premium": ("Премиум", 50),
+    "vip":     ("VIP",     125),
+    "legend":  ("Легенда", 500),
+}
+_BUNDLE_INFO = {
+    "start":  ("Старт",      99),
+    "deluxe": ("Делюкс",    250),
+    "cosmic": ("Космический",999),
+}
+
+
 def get_donate_keyboard():
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    """Главное меню доната — список в цитате, кнопки управления снизу."""
+    rows = [
+        # Ряд 1: Купить + Кошелёк
         [
-            InlineKeyboardButton(text="⭐ Премиум", callback_data="buy_premium"),
-            InlineKeyboardButton(text="👑 VIP", callback_data="buy_vip"),
-            InlineKeyboardButton(text="🌟 Легенда", callback_data="buy_legend")
+            InlineKeyboardButton(text="🛒 Купить",    callback_data="donate_buy_menu"),
+            InlineKeyboardButton(text="👛 Кошелёк",   callback_data="donate_wallet"),
         ],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")]
+        # Ряд 2: Назад + Промокоды
+        [
+            InlineKeyboardButton(text="◀️ Назад",     callback_data="back_to_menu"),
+            InlineKeyboardButton(text="🎟 Промокоды", callback_data="my_nick_promos"),
+        ],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_donate_buy_keyboard():
+    """Меню покупки — только кнопки привилегий и наборов, без разделителей."""
+    priv_row = [
+        InlineKeyboardButton(text=label, callback_data=f"donate_buy:{k}")
+        for k, (label, price) in _PRIV_INFO.items()
+    ]
+    bundle_row = [
+        InlineKeyboardButton(text=label, callback_data=f"donate_buy:{k}")
+        for k, (label, price) in _BUNDLE_INFO.items()
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        priv_row,
+        bundle_row,
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_menu")],
     ])
-    return keyboard
+
+
+# Данные наборов
+BUNDLES = {
+    "start": {
+        "name": "Старт", "stars": 99,
+        "desc": "Набор для новичка",
+        "items": ["500 тон", "Мини-риг", "GTX 1050 Ti"]
+    },
+    "deluxe": {
+        "name": "Делюкс", "stars": 299,
+        "desc": "Для опытных майнеров",
+        "items": ["2000 тон", "Midi-rig", "RTX 3060", "Премиум 14 дней"]
+    },
+    "cosmic": {
+        "name": "Космический", "stars": 999,
+        "desc": "Максимальный старт",
+        "items": ["10000 тон", "Mega-rig", "RTX 3090", "VIP 30 дней", "Antminer S9"]
+    },
+}
+
+
+async def _show_priv_info(target, priv_key: str):
+    """Карточка привилегии"""
+    p = config.PRIVILEGES.get(priv_key)
+    if not p:
+        return
+    b = p["bonuses"]
+    text = (
+        f"{p['icon']} <b>{p['name']}</b> — {p['price']} ★\n\n"
+        f"<blockquote>"
+        f"x{b['ton_multiplier']} к доходу от майнинга\n"
+        f"x{b['exp_multiplier']} к опыту\n"
+        f"-{b['repair_discount']}% к ремонту\n"
+        f"+{b['hash_bonus']} MH/s ко всем картам\n"
+        f"Макс. карт: {b['max_cards']}\n"
+        f"</blockquote>\n\n"
+        f"Действует 30 дней."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Купить {p['name']} ({p['price']} ★)",
+                              callback_data=f"buy_{priv_key}")],
+        [InlineKeyboardButton(text="◀️ Донат магазин", callback_data="donate_menu")],
+    ])
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        try:
+            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+DONATE_PRIV_KEYS = {"premium", "vip", "legend"}
+DONATE_BUNDLE_KEYS = {"start", "deluxe", "cosmic"}
+DONATE_PRIV_LABELS = {"premium": "Премиум", "vip": "VIP", "legend": "Легенда"}
+DONATE_BUNDLE_LABELS = {"start": "Старт", "deluxe": "Делюкс", "cosmic": "Космический"}
+
+
+def _donate_main_text(user, current_privilege, until) -> str:
+    """Текст главного меню доната с цитатой-списком."""
+    if current_privilege != "player":
+        pd = config.PRIVILEGES[current_privilege]
+        until_str = datetime.fromisoformat(until).strftime("%d.%m.%Y") if until else "навсегда"
+        priv_line = f"{pd['icon']} {pd['name']} (до {until_str})"
+    else:
+        priv_line = "Обычный игрок"
+    stars = db.get_stars(user[0])
+
+    return (
+        f"🪙 <b>Донат магазин</b>\n\n"
+        f"<blockquote>"
+        f"Привилегии:\n"
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=priv_premium">Премиум</a> » 50 ⭐\n'
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=priv_vip">VIP</a> » 125 ⭐\n'
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=priv_legend">Легенда</a> » 500 ⭐\n'
+        f"Наборы:\n"
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=bundle_start">Старт</a> » 99 ⭐\n'
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=bundle_deluxe">Делюкс</a> » 250 ⭐\n'
+        f' <a href="https://t.me/{config.BOT_USERNAME}?start=bundle_cosmic">Космический</a> » 999 ⭐'
+        f"</blockquote>\n\n"
+        f"Привилегия: {priv_line}\n"
+        f"Баланс: {int(user[4])} тон | {stars} ⭐\n\n"
+        f"Выберите действие:"
+    )
+
+
+@dp.callback_query(F.data.startswith("donate_select:"))
+async def callback_donate_select(callback: CallbackQuery):
+    """Нажатие на название товара — показывает его описание."""
+    await callback.answer()
+    selected = callback.data.split(":")[1]
+    await _show_priv_or_bundle(callback, selected)
+
+
+async def _show_priv_or_bundle(target, key: str):
+    """Показывает карточку привилегии или набора с кнопкой Купить."""
+    if key in DONATE_PRIV_KEYS:
+        await _show_priv_info(target, key)
+    elif key in DONATE_BUNDLE_KEYS:
+        bun = BUNDLES.get(key)
+        if not bun:
+            return
+        items_str = "\n".join(f"• {i}" for i in bun["items"])
+        text = (
+            f"📦 <b>Набор «{bun['name']}»</b> — {bun['stars']} ⭐\n\n"
+            f"{bun['desc']}\n"
+            f"<blockquote>{items_str}</blockquote>"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"Купить {bun['stars']} ⭐", callback_data=f"donate_buy:{key}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_buy_menu")],
+        ])
+        if isinstance(target, Message):
+            await target.answer(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            try:
+                await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            except Exception:
+                await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "donate_buy_menu")
+async def callback_donate_buy_menu(callback: CallbackQuery):
+    """Меню покупки — список всех товаров."""
+    await callback.answer()
+    bu = config.BOT_USERNAME
+    text = (
+        "🛒 <b>Выберите товар</b>\n\n"
+        "<blockquote>"
+        "Привилегии:\n"
+        f' <a href="https://t.me/{bu}?start=priv_premium">Премиум</a> » 50 ⭐\n'
+        f' <a href="https://t.me/{bu}?start=priv_vip">VIP</a> » 125 ⭐\n'
+        f' <a href="https://t.me/{bu}?start=priv_legend">Легенда</a> » 500 ⭐\n'
+        "Наборы:\n"
+        f' <a href="https://t.me/{bu}?start=bundle_start">Старт</a> » 99 ⭐\n'
+        f' <a href="https://t.me/{bu}?start=bundle_deluxe">Делюкс</a> » 250 ⭐\n'
+        f' <a href="https://t.me/{bu}?start=bundle_cosmic">Космический</a> » 999 ⭐'
+        "</blockquote>"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=get_donate_buy_keyboard(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=get_donate_buy_keyboard(), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "donate_agreement")
+async def callback_donate_agreement(callback: CallbackQuery):
+    await callback.answer()
+    text = (
+        "📋 <b>Пользовательское соглашение</b>\n\n"
+        "<blockquote>"
+        "• Все покупки совершаются добровольно.\n"
+        "• Звёзды Telegram используются как внутренняя валюта бота.\n"
+        "• Возврат средств не предусмотрен.\n"
+        "• Привилегии действуют 30 дней с момента покупки.\n"
+        "• Администрация оставляет за собой право изменять условия."
+        "</blockquote>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_menu")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+
+
+@dp.callback_query(F.data.startswith("donate_buy:"))
+async def callback_donate_buy(callback: CallbackQuery):
+    """Кнопка Купить — перенаправляет на покупку привилегии или набора"""
+    await callback.answer()
+    key = callback.data.split(":")[1]
+    if key in DONATE_PRIV_KEYS:
+        await buy_privilege(callback.message, key)
+    elif key in DONATE_BUNDLE_KEYS:
+        await callback.answer("🚧 Покупка наборов скоро будет доступна!", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("priv_info:"))
+async def callback_priv_info(callback: CallbackQuery):
+    await callback.answer()
+    priv_key = callback.data.split(":")[1]
+    await _show_priv_info(callback, priv_key)
+
+
+@dp.message(Command("premium"))
+async def cmd_premium(message: Message):
+    await _show_priv_info(message, "premium")
+
+
+@dp.message(Command("vip"))
+async def cmd_vip(message: Message):
+    await _show_priv_info(message, "vip")
+
+
+@dp.message(Command("legend"))
+async def cmd_legend(message: Message):
+    await _show_priv_info(message, "legend")
+
+
+@dp.callback_query(F.data.startswith("bundle_info:"))
+async def callback_bundle_info(callback: CallbackQuery):
+    await callback.answer()
+    key = callback.data.split(":")[1]
+    b = BUNDLES.get(key)
+    if not b:
+        return
+    items_str = "\n".join(f"• {i}" for i in b["items"])
+    text = (
+        f"📦 <b>Набор «{b['name']}»</b> — {b['stars']} ★\n\n"
+        f"{b['desc']}\n\n"
+        f"<blockquote>{items_str}</blockquote>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Купить ({b['stars']} ★)", callback_data=f"buy_bundle:{key}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_menu")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("buy_bundle:"))
+async def callback_buy_bundle(callback: CallbackQuery):
+    await callback.answer("🚧 Покупка наборов скоро будет доступна!", show_alert=True)
+
+
+def _wallet_text_kb(ton_bal, stars_bal):
+    """Текст и клавиатура кошелька."""
+    text = (
+        f"👛 <b>Кошелёк</b>\n\n"
+        f"<blockquote>"
+        f"💰 Тон ›› {ton_bal}\n"
+        f"⭐ Звёзды ›› {stars_bal}\n"
+        f"</blockquote>\n\n"
+        f"Курс обмена: 1 ⭐ = 100 💰 тон\n"
+        f"<i>Выбери количество звёзд для обмена или введи своё:</i>"
+    )
+    # Пресеты: 1 5 10 25 50 — показываем только если есть звёзды
+    presets = [1, 5, 10, 25, 50]
+    preset_row = [
+        InlineKeyboardButton(text=str(n), callback_data=f"stars_ex_do:{n}")
+        for n in presets
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        preset_row,
+        [InlineKeyboardButton(text="✏️ Ввести вручную", callback_data="stars_ex_input")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_menu")],
+    ])
+    return text, kb
+
+
+@dp.callback_query(F.data == "donate_wallet")
+async def callback_donate_wallet(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    user = db.get_user(callback.from_user.id)
+    ton_bal = int(user[4]) if user[4] else 0
+    stars_bal = db.get_stars(callback.from_user.id)
+    text, kb = _wallet_text_kb(ton_bal, stars_bal)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "stars_ex_input")
+async def callback_stars_ex_input(callback: CallbackQuery, state: FSMContext):
+    """Запрашиваем ввод количества звёзд вручную."""
+    await callback.answer()
+    user = db.get_user(callback.from_user.id)
+    stars_bal = db.get_stars(callback.from_user.id)
+    await state.set_state(WalletStates.waiting_stars_amount)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="donate_wallet")]
+    ])
+    await callback.message.edit_text(
+        f"👛 <b>Обмен звёзд</b>\n\n"
+        f"У тебя: <b>{stars_bal} ⭐</b>\n\n"
+        f"Введи количество звёзд для обмена (1 ⭐ = 100 💰):",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.message(WalletStates.waiting_stars_amount, F.text[0] != "/")
+async def process_stars_amount(message: Message, state: FSMContext):
+    if not message.text.isdigit() or int(message.text) <= 0:
+        await message.answer("❌ Введи целое число больше 0")
+        return
+    amount = int(message.text)
+    await state.clear()
+    await _do_stars_exchange(message, amount)
+
+
+@dp.callback_query(F.data.startswith("stars_ex_do:"))
+async def callback_stars_ex_do(callback: CallbackQuery, state: FSMContext):
+    """Обмен по пресету."""
+    await callback.answer()
+    await state.clear()
+    amount = int(callback.data.split(":")[1])
+    await _do_stars_exchange(callback, amount)
+
+
+async def _do_stars_exchange(target, amount: int):
+    """Основная логика обмена. target — Message или CallbackQuery."""
+    user_id = target.from_user.id
+    user = db.get_user(user_id)
+    stars_bal = db.get_stars(user_id)
+    ton_bal = int(user[4]) if user[4] else 0
+
+    if stars_bal >= amount:
+        # Достаточно звёзд — меняем сразу
+        ton_gain = amount * 100
+        db.cursor.execute(
+            "UPDATE users SET stars_balance=stars_balance-?, gems=gems+? WHERE user_id=?",
+            (amount, ton_gain, user_id)
+        )
+        db.conn.commit()
+        text = (
+            f"✅ <b>Обмен выполнен!</b>\n\n"
+            f"⭐ {amount} звёзд → 💰 {ton_gain} тон\n\n"
+            f"Баланс: 💰 {ton_bal + ton_gain} тон | ⭐ {stars_bal - amount} звёзд"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👛 Кошелёк", callback_data="donate_wallet")],
+            [InlineKeyboardButton(text="◀️ Донат магазин", callback_data="donate_menu")],
+        ])
+    else:
+        # Не хватает — предлагаем купить недостающее через Telegram Stars
+        need = amount - stars_bal
+        text = (
+            f"⭐ <b>Недостаточно звёзд</b>\n\n"
+            f"Нужно: {amount} ⭐\n"
+            f"Есть: {stars_bal} ⭐\n"
+            f"Не хватает: <b>{need} ⭐</b>\n\n"
+            f"Купи недостающие {need} ⭐ через Telegram и они автоматически зачислятся на баланс."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"⭐ Купить {need} звёзд в Telegram",
+                url=f"https://t.me/stars?amount={need}"
+            )],
+            [InlineKeyboardButton(text="👛 Кошелёк", callback_data="donate_wallet")],
+        ])
+
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        try:
+            await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await target.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "my_nick_promos")
+async def callback_my_nick_promos(callback: CallbackQuery):
+    await callback.answer()
+    c = db.conn.cursor()
+    c.execute("SELECT code, used FROM nick_promos WHERE user_id=? ORDER BY id DESC",
+              (callback.from_user.id,))
+    rows = c.fetchall()
+    if not rows:
+        text = "🎟 <b>Твои промокоды на ник</b>\n\nПока нет промокодов.\nИх можно получить из боксов (шанс 1%)."
+    else:
+        lines = []
+        for code, used in rows:
+            status = "✅ Использован" if used else "🟢 Активен"
+            lines.append(f"<code>{code}</code> — {status}")
+        text = "🎟 <b>Твои промокоды на ник</b>\n\n" + "\n".join(lines)
+        text += "\n\n<i>Используй: /nick НОВЫЙ_НИК ПРОМОКОД</i>"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="donate_menu")]
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 def get_level_keyboard():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -3527,6 +4034,20 @@ async def cmd_start(message: Message, state: FSMContext):
     args = message.text.split()
     referrer_id = None
 
+    # Deeplink: /start priv_XXX — описание привилегии
+    if len(args) > 1 and args[1].startswith("priv_"):
+        db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        priv_key = args[1][5:]  # убираем "priv_"
+        await _show_priv_info(message, priv_key)
+        return
+
+    # Deeplink: /start bundle_XXX — описание набора
+    if len(args) > 1 and args[1].startswith("bundle_"):
+        db.add_user(message.from_user.id, message.from_user.username, message.from_user.first_name)
+        bundle_key = args[1][7:]  # убираем "bundle_"
+        await _show_priv_or_bundle(message, bundle_key)
+        return
+
     # Deeplink: /start check_XXXXXXXX — активация чека/счёта
     if len(args) > 1 and args[1].startswith("check_"):
         code = args[1][6:].upper()
@@ -3655,11 +4176,13 @@ async def cmd_mine(message: Message):
 
     await message.answer(result, reply_markup=keyboard, parse_mode="HTML")
     if success:
-        advance_quest(message.from_user.id, "mine")
-        # earn — считаем по base_ton из result (упрощённо через daily_mines)
-        _u2 = db.get_user(message.from_user.id)
-        if _u2:
-            _dm = _u2[-1] if _u2 else 0  # daily_mines — последняя колонка
+        _qc = advance_quest(message.from_user.id, "mine")
+        for _qq in _qc:
+            await message.answer(
+                f"✅ <b>Задание выполнено!</b>\n"
+                f"{_qq['icon']} {_qq['desc']}\n"
+                f"💰 +{_qq['reward_ton']} тон  ✨ +{_qq['reward_exp']} опыта",
+                parse_mode="HTML")
 
 @dp.message(Command("nick"))
 async def cmd_nick(message: Message):
@@ -4165,6 +4688,60 @@ async def back_to_menu(callback: CallbackQuery):
         reply_markup=get_main_keyboard(),
         parse_mode="HTML"
     )
+
+MKT_FILTER_OPTS = [
+    ("all",       "Все товары"),
+    ("gpu",       "Видеокарты (GPU)"),
+    ("cooler",    "Куллеры"),
+    ("component", "Компоненты"),
+]
+
+
+@dp.callback_query(F.data.startswith("mkt_filter_menu:"))
+async def callback_mkt_filter_menu(callback: CallbackQuery):
+    await callback.answer()
+    parts = callback.data.split(":")
+    sort = parts[1]
+    page_str = parts[2]
+
+    sorts = [
+        ("Дешевле",  "price_asc"),
+        ("Дороже",   "price_desc"),
+        ("Хешрейт",  "hash_desc"),
+        ("Износ",    "wear_desc"),
+        ("Новые",    "new"),
+    ]
+    filter_labels = {"all": "Все", "gpu": "GPU", "cooler": "Куллеры", "component": "Компоненты"}
+
+    buttons = []
+    # Сортировка — 3 + 2
+    buttons.append([
+        InlineKeyboardButton(
+            text=("✅ " if s[1] == sort else "") + s[0],
+            callback_data=f"mkt_filter_menu:{s[1]}:{page_str}"
+        ) for s in sorts[:3]
+    ])
+    buttons.append([
+        InlineKeyboardButton(
+            text=("✅ " if s[1] == sort else "") + s[0],
+            callback_data=f"mkt_filter_menu:{s[1]}:{page_str}"
+        ) for s in sorts[3:]
+    ])
+    # Категории
+    buttons.append([
+        InlineKeyboardButton(
+            text=label,
+            callback_data=f"mkt_sort:{sort}:{key}:{page_str}"
+        ) for key, label in MKT_FILTER_OPTS
+    ])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"mkt_sort:{sort}:all:{page_str}")])
+
+    await callback.message.edit_text(
+        "🔍 <b>Фильтры барахолки</b>\n\nСортировка и категория:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML"
+    )
+
 
 @dp.callback_query(F.data == "noop")
 async def noop_handler(callback: CallbackQuery):
@@ -6164,71 +6741,18 @@ async def callback_donate_menu(callback: CallbackQuery):
     user = db.get_user(callback.from_user.id)
     current_privilege, until = db.get_user_privilege(callback.from_user.id)
     
-    text = (
-        f"🪙 <b>Поддержать проект</b>\n\n"
-        f"Приобрети привилегию и получи уникальные бонусы в игре!\n"
-        f"Все средства идут на развитие бота 🚀\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    
-    # Премиум
-    text += (
-        f"<b>⭐ ПРЕМИУМ</b> — 50 ★\n"
-        f"<blockquote>"
-        f"• x1.5 к доходу от майнинга\n"
-        f"• x1.5 к опыту\n"
-        f"• -10% к ремонту\n"
-        f"• Макс. карт: 15"
-        f"</blockquote>\n\n"
-    )
-    
-    # VIP
-    text += (
-        f"<b>👑 VIP</b> — 150 ★\n"
-        f"<blockquote>"
-        f"• x2 к доходу от майнинга\n"
-        f"• x2 к опыту\n"
-        f"• -20% к ремонту\n"
-        f"• +5 MH/s ко всем картам\n"
-        f"• Макс. карт: 20"
-        f"</blockquote>\n\n"
-    )
-    
-    # Легенда
-    text += (
-        f"<b>🌟 ЛЕГЕНДА</b> — 500 ★\n"
-        f"<blockquote>"
-        f"• x3 к доходу от майнинга\n"
-        f"• x3 к опыту\n"
-        f"• -30% к ремонту\n"
-        f"• +10 MH/s ко всем картам\n"
-        f"• Макс. карт: 25\n"
-        f"• Увеличен шанс событий"
-        f"</blockquote>\n\n"
-    )
-    
-    text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
-    
     if current_privilege != "player":
         priv_data = config.PRIVILEGES[current_privilege]
         until_str = datetime.fromisoformat(until).strftime('%d.%m.%Y') if until else "навсегда"
-        text += f"✨ <b>Твоя привилегия:</b> {priv_data['icon']} {priv_data['name']}\n"
-        text += f"📅 <b>Действует до:</b> {until_str}\n\n"
+        priv_line = f"{priv_data['icon']} {priv_data['name']} (до {until_str})"
     else:
-        text += f"✨ <b>Твоя привилегия:</b> Обычный игрок\n\n"
-    
-    text += (
-        f"💰 <b>Твой баланс:</b> {int(user[4])} тон\n"
-        f"💎 <b>Звезд:</b> {user[18] if len(user) > 18 and user[18] else 0} ★\n\n"
-    )
-    
-    text += f"👇 <b>Выбери привилегию для покупки:</b>"
-    
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_donate_keyboard(),
-        parse_mode="HTML"
-    )
+        priv_line = "Обычный игрок"
+    stars = user[18] if len(user) > 18 and user[18] else 0
+    text = _donate_main_text(user, current_privilege, until)
+    try:
+        await callback.message.edit_text(text, reply_markup=get_donate_keyboard(), parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=get_donate_keyboard(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "buy_premium")
 async def callback_buy_premium(callback: CallbackQuery):
@@ -6898,7 +7422,7 @@ async def show_user_profile(message_or_callback, user_id, is_own=True):
         return
     
     first_name = user[3]
-    admin_tag = " 👑 АДМИН" if is_admin(user_id) else ""
+    admin_tag = " АДМИН" if is_admin(user_id) else ""
     
     created_at = datetime.fromisoformat(user[12])
     hours_in_game = int((datetime.now() - created_at).total_seconds() / 3600)
@@ -6920,19 +7444,19 @@ async def show_user_profile(message_or_callback, user_id, is_own=True):
     profile_text = (
         f"{profile_title}\n\n"
         f"<blockquote>"
-        f"👤 {escape_html(first_name)}{admin_tag}\n"
-        f"├ 🆔 MID ›› {mid}\n"
-        f"├ {get_level_icon(level)} Уровень ›› {level}\n"
-        f"│  └ 📊 Опыт ›› {exp}\n"
-        f"└ ⏰ В игре ›› {hours_in_game} ч\n"
+        f"{escape_html(first_name)}{admin_tag}\n"
+        f"├ MID ›› {mid}\n"
+        f"├ Уровень ›› {level}\n"
+        f"│  └ Опыт ›› {exp}\n"
+        f"└ В игре ›› {hours_in_game} ч\n"
         f"\n"
         f"<b>Баланс:</b>\n"
-        f"├💰 Тон ›› {ton}\n"
-        f"└ ⚡ Хешрейт ›› {hash_rate:.1f} MH/s\n"
+        f"├ Тон ›› {ton}\n"
+        f"└ Хешрейт ›› {hash_rate:.1f} MH/s\n"
         f"\n"
         f"<b>Статистика:</b>\n"
-        f"├👤 Рефералов ›› {referrals}\n"
-        f"└📦 Коробок ›› {boxes_count}\n"
+        f"├ Рефералов ›› {referrals}\n"
+        f"└ Коробок ›› {boxes_count}\n"
         f"</blockquote>\n\n"
     )
     
@@ -7010,19 +7534,25 @@ async def show_level_info(message_or_callback, user_id):
         )
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Повысить уровень", callback_data="level_up")]
+            [InlineKeyboardButton(text="✅ Повысить уровень", callback_data="level_up")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
         ])
     else:
         if current_level >= config.MAX_LEVEL:
             text = f"{level_icon} <b>🏆 Достигнут максимальный уровень!</b>"
         else:
             text = f"{level_icon} <b>Информация об уровне недоступна</b>"
-        keyboard = None
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
+        ])
     
     if isinstance(message_or_callback, Message):
         await message_or_callback.answer(text, reply_markup=keyboard, parse_mode="HTML")
     else:
-        await message_or_callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        try:
+            await message_or_callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            await message_or_callback.message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 async def buy_privilege(message: Message, privilege_name):
     """Функция для покупки привилегии"""
@@ -8422,15 +8952,13 @@ async def callback_open_box_now(callback: CallbackQuery):
     remaining = user[16] if user and len(user) > 16 else 0
 
     if success:
-        keyboard = None
-        if remaining > 0:
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text=f"📦 Открыть ещё ({remaining} шт.)",
-                    callback_data="open_box_now"
-                )]
-            ])
-        await callback.message.answer(result, reply_markup=keyboard, parse_mode="HTML")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Открыть ещё" + (f" ({remaining} шт.)" if remaining > 0 else ""), callback_data="open_box_now")],
+        ]) if remaining > 0 else None
+        try:
+            await callback.message.edit_text(result, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(result, reply_markup=keyboard, parse_mode="HTML")
     else:
         await callback.message.answer(f"❌ {result}")
 
@@ -8880,29 +9408,12 @@ async def market_expire_scheduler():
 
 
 def market_sort_keyboard(current_sort, item_type_filter, page):
-    """Кнопки сортировки"""
-    sorts = [
-        ("💰 Дешевле", "price_asc"),
-        ("💎 Дороже", "price_desc"),
-        ("⚡ Хешрейт", "hash_desc"),
-        ("🛡 Износ", "wear_desc"),
-        ("🆕 Новые", "new"),
-    ]
-    filter_labels = {"all": "Все", "gpu": "GPU", "cooler": "Куллеры"}
-    type_cycle = {"all": "gpu", "gpu": "cooler", "cooler": "all"}
-
+    """Только кнопка фильтров — сортировка внутри меню фильтров."""
+    filter_labels = {"all": "Все товары", "gpu": "GPU", "cooler": "Куллеры", "component": "Компоненты"}
     buttons = [
         [InlineKeyboardButton(
-            text=f"{'✅ ' if s[1] == current_sort else ''}{s[0]}",
-            callback_data=f"mkt_sort:{s[1]}:{item_type_filter}:{page}"
-        ) for s in sorts[:3]],
-        [InlineKeyboardButton(
-            text=f"{'✅ ' if s[1] == current_sort else ''}{s[0]}",
-            callback_data=f"mkt_sort:{s[1]}:{item_type_filter}:{page}"
-        ) for s in sorts[3:]],
-        [InlineKeyboardButton(
-            text=f"🔍 Тип: {filter_labels.get(item_type_filter, 'Все')}",
-            callback_data=f"mkt_sort:{current_sort}:{type_cycle.get(item_type_filter, 'all')}:{page}"
+            text="🔍 Фильтры: " + filter_labels.get(item_type_filter, "Все"),
+            callback_data=f"mkt_filter_menu:{current_sort}:{page}"
         )],
     ]
     return buttons
@@ -8996,6 +9507,17 @@ async def callback_market(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     text, kb = build_market_text_and_keyboard(callback.from_user.id, "price_asc", "all", 0)
     await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+MKT_FILTER_OPTS = [
+    ("all",       "Все товары"),
+    ("gpu",       "Видеокарты (GPU)"),
+    ("cooler",    "Куллеры"),
+    ("component", "Компоненты"),
+]
+
+
+
 
 
 @dp.callback_query(F.data == "noop")
@@ -9433,4 +9955,3 @@ if __name__ == "__main__":
         print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
-        
